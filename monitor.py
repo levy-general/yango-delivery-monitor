@@ -23,7 +23,9 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
@@ -130,7 +132,16 @@ def bootstrap_auth():
         AUTH_PATH.write_bytes(base64.b64decode(b64))
 
 
+def in_quiet_hours() -> bool:
+    """Skip runs between 23:00 and 13:00 Israel time."""
+    hour = datetime.now(ZoneInfo("Asia/Jerusalem")).hour
+    return hour >= 23 or hour < 13
+
+
 def main():
+    if in_quiet_hours():
+        print("Quiet hours (23:00–13:00 Asia/Jerusalem) — skipping.")
+        return
     bootstrap_auth()
     state = load_state()
     prev_cost = state.get("deliveryCost")
