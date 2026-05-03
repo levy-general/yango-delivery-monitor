@@ -1,0 +1,54 @@
+name: Check Yango Deli price
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay during peak load)
+  workflow_dispatch:          # allow manual trigger from the Actions tab
+
+permissions:
+  contents: write             # required so the workflow can commit state.json back
+
+concurrency:
+  group: yango-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AUTH_B64: ${{ secrets.AUTH_B64 }}
+        run: python monitor.py
+
+      - name: Commit updated state
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name "yango-monitor"
+            git config user.email "yango-monitor@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update state [skip ci]"
+            git push
+          else
+            echo "state.json unchanged"
+          fi

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+auth.json
+cookies.json
+*.png
+*.html
+api_log.json
+requests.log
+.env
