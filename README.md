@@ -1,8 +1,11 @@
-# Yango Deli price monitor
+# Levy alerts bot
 
-Polls the Yango Deli delivery price for a fixed address every 15 minutes via
-GitHub Actions and sends a Telegram alert when the delivery cost drops below
-a threshold (default 15 ₪).
+Two monitors that share one Telegram bot and one GitHub Actions cron:
+
+- **Yango Deli** (`monitor.py`) — alert when delivery cost to a fixed address
+  crosses below 15 ₪. Active 13:00–23:00 Asia/Jerusalem.
+- **Surf Park TLV** (`monitor_srf.py`) — alert ~1h45m before an L6 reef-left
+  session that has more than 12 spots available. Active 08:00–18:00.
 
 ## How it works
 

@@ -133,7 +133,7 @@ def bootstrap_auth():
 
 
 def in_quiet_hours() -> bool:
-    """Skip runs between 23:00 and 13:00 Israel time."""
+    """Skip runs outside 13:00–23:00 Israel time (Yango)."""
     hour = datetime.now(ZoneInfo("Asia/Jerusalem")).hour
     return hour >= 23 or hour < 13
 

@@ -1,15 +1,15 @@
-name: Check Yango Deli price
+name: Check prices and surf sessions
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay during peak load)
-  workflow_dispatch:          # allow manual trigger from the Actions tab
+    - cron: "*/15 * * * *"   # every 15 minutes; each script self-skips outside its active hours
+  workflow_dispatch:
 
 permissions:
-  contents: write             # required so the workflow can commit state.json back
+  contents: write
 
 concurrency:
-  group: yango-monitor
+  group: monitors
   cancel-in-progress: false
 
 jobs:
@@ -34,21 +34,33 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run monitor
+      - name: Run Yango monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           AUTH_B64: ${{ secrets.AUTH_B64 }}
         run: python monitor.py
 
+      - name: Run Surf Park monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor_srf.py
+
       - name: Commit updated state
         run: |
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
-            git config user.name "yango-monitor"
-            git config user.email "yango-monitor@users.noreply.github.com"
-            git add state.json
+          git config user.name "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+          changed=0
+          for f in state.json srf_state.json; do
+            if [[ -f "$f" && -n "$(git status --porcelain "$f")" ]]; then
+              git add "$f"
+              changed=1
+            fi
+          done
+          if [[ $changed -eq 1 ]]; then
             git commit -m "chore: update state [skip ci]"
             git push
           else
-            echo "state.json unchanged"
+            echo "No state changes."
           fi
