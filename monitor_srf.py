@@ -29,8 +29,9 @@ URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show-adults=fa
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 THRESHOLD = int(os.environ.get("SRF_THRESHOLD", "12"))
-LEAD_MIN = int(os.environ.get("SRF_LEAD_MINUTES", "105"))   # 1h45m
-WINDOW_MIN = int(os.environ.get("SRF_WINDOW_MINUTES", "8"))  # ±8 min around the lead time
+# Comma-separated lead times in minutes; alert once at each lead window.
+LEAD_MINS = [int(x) for x in os.environ.get("SRF_LEAD_MINUTES", "105,75").split(",")]
+WINDOW_MIN = int(os.environ.get("SRF_WINDOW_MINUTES", "8"))  # ±8 min around each lead time
 STATE_PATH = Path(os.environ.get("STATE_PATH", "srf_state.json"))
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -138,40 +139,42 @@ def main():
     print(f"Parsed {len(sessions)} sessions.")
 
     now = datetime.now(TZ)
-    target = timedelta(minutes=LEAD_MIN)
     window = timedelta(minutes=WINDOW_MIN)
 
     for s in sessions:
         if s["level"] != 6 or "left" not in s["area"].lower():
             continue
         time_until = s["start"] - now
-        in_window = (target - window) <= time_until <= (target + window)
-        print(f"  L6-left id={s['id']} start={s['start'].strftime('%Y-%m-%d %H:%M')} "
-              f"spots={s['spots']} in_window={in_window} alerted={s['id'] in alerted}")
-        if not in_window:
-            continue
-        if s["spots"] <= THRESHOLD:
-            continue
-        if s["id"] in alerted:
-            continue
+        for lead in LEAD_MINS:
+            target = timedelta(minutes=lead)
+            in_window = (target - window) <= time_until <= (target + window)
+            key = f"{s['id']}_{lead}"
+            print(f"  L6-left id={s['id']} start={s['start'].strftime('%Y-%m-%d %H:%M')} "
+                  f"spots={s['spots']} lead={lead}m in_window={in_window} alerted={key in alerted}")
+            if not in_window or s["spots"] <= THRESHOLD or key in alerted:
+                continue
 
-        msg = (
-            f"🏄 <b>Surf Park</b>\n"
-            f"שם הסשן: {s['title']}\n"
-            f"שעה: {s['start'].strftime('%H:%M')} ({s['start'].strftime('%d/%m')})\n"
-            f"מקומות פנויים: {s['spots']}\n"
-            f"<a href=\"{URL}\">לרשום עכשיו →</a>"
-        )
-        telegram_send(msg)
-        alerted.add(s["id"])
-        print(f"  → ALERT sent for session {s['id']}")
+            mins_to = int(time_until.total_seconds() / 60)
+            msg = (
+                f"🏄 <b>Surf Park</b>\n"
+                f"שם הסשן: {s['title']}\n"
+                f"שעה: {s['start'].strftime('%H:%M')} ({s['start'].strftime('%d/%m')}) — בעוד ~{mins_to} דק'\n"
+                f"מקומות פנויים: {s['spots']}\n"
+                f"<a href=\"{URL}\">לרשום עכשיו →</a>"
+            )
+            telegram_send(msg)
+            alerted.add(key)
+            print(f"  → ALERT sent for {key}")
 
-    # Prune ids of sessions that are clearly in the past (>6h ago)
+    # Prune keys of sessions that are clearly in the past (>6h ago)
     cutoff = now - timedelta(hours=6)
+    by_id = {s["id"]: s for s in sessions}
     keep = set()
-    for s in sessions:
-        if s["id"] in alerted and s["start"] > cutoff:
-            keep.add(s["id"])
+    for key in alerted:
+        sid = key.split("_")[0]
+        s = by_id.get(sid)
+        if s and s["start"] > cutoff:
+            keep.add(key)
     state["alerted_ids"] = sorted(keep)
     save_state(state)
 
