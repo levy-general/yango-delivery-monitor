@@ -67,8 +67,8 @@ HOUR_RE = re.compile(r'<div class="hour">([^<]+)</div>')
 TITLE_RE = re.compile(r'<div class="title">\s*([^<]+?)\s*<')
 
 
-def is_weekend() -> bool:
-    """Skip Friday and Saturday entirely."""
+def alerts_disabled_today() -> bool:
+    """No surf-session alerts on Friday/Saturday (no sessions)."""
     return datetime.now(TZ).weekday() in (4, 5)  # Mon=0 ... Fri=4, Sat=5
 
 
@@ -175,7 +175,8 @@ def daily_summary(sessions: list[dict], state: dict, force: bool = False) -> Non
         in_window = (h == 19 and m >= 55) or (h == 20 and m <= 30)
         if not in_window:
             return
-        # Skip Thursday (weekday 3) and Friday (weekday 4) — no Fri/Sat sessions to report
+        # Today's weekday → tomorrow has sessions?
+        # Thu (3) → Fri = no sessions; Fri (4) → Sat = no sessions. Sat (5) → Sun = yes.
         if now.weekday() in (3, 4):
             return
         if state.get("last_summary_date") == today:
@@ -202,28 +203,33 @@ def daily_summary(sessions: list[dict], state: dict, force: bool = False) -> Non
 
 
 def main():
-    if is_weekend():
-        print("Weekend (Fri/Sat) — skipping.")
-        return
-    if in_quiet_hours():
-        print("Quiet hours (18:00–08:00 Asia/Jerusalem) — skipping alerts.")
-        # Daily summary at ~20:00 — fall through to summary logic below.
-        state = load_state()
-        try:
-            sessions = parse_sessions(fetch_html())
-            daily_summary(sessions, state)
-            save_state(state)
-        except Exception as e:
-            print(f"summary error: {e}", file=sys.stderr)
-        return
-
     state = load_state()
-    alerted = set(state.get("alerted_ids", []))
 
-    html = fetch_html()
-    sessions = parse_sessions(html)
-    print(f"Parsed {len(sessions)} sessions.")
+    # Daily summary path — runs every day at ~20:00 (the function itself decides
+    # whether tomorrow has sessions worth summarizing). Sessions are also needed
+    # for alerts below, so fetch unconditionally outside quiet hours.
+    in_quiet = in_quiet_hours()
+    no_alerts_today = alerts_disabled_today()
+
+    try:
+        sessions = parse_sessions(fetch_html())
+    except Exception as e:
+        print(f"fetch error: {e}", file=sys.stderr)
+        return
+
     daily_summary(sessions, state)
+
+    if no_alerts_today:
+        print("Fri/Sat — alerts disabled.")
+        save_state(state)
+        return
+    if in_quiet:
+        print("Quiet hours — alerts skipped.")
+        save_state(state)
+        return
+
+    alerted = set(state.get("alerted_ids", []))
+    print(f"Parsed {len(sessions)} sessions.")
 
     now = datetime.now(TZ)
     window = timedelta(minutes=WINDOW_MIN)
