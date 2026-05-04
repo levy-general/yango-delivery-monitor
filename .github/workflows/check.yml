@@ -1,8 +1,11 @@
 name: Check prices and surf sessions
 
 on:
+  # External trigger via cron-job.org calls the workflow_dispatch API every 15
+  # minutes; that's reliable. GH's own schedule cron is unreliable, so we keep
+  # it as a once-per-hour backup only.
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes; each script self-skips outside its active hours
+    - cron: "5 * * * *"
   workflow_dispatch:
 
 permissions:
