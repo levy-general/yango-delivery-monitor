@@ -43,7 +43,16 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", "srf_state.json"))
 PREFS_PATH = Path(os.environ.get("PREFS_PATH", "prefs.json"))
 
 
+PREFS_URL = os.environ.get("PREFS_URL", "https://levy-bot.shayko22.workers.dev/prefs")
+
+
 def load_prefs() -> dict:
+    """Try the worker first (live, instant updates), then a local file, then defaults."""
+    try:
+        with urllib.request.urlopen(PREFS_URL, timeout=8) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"prefs from worker failed: {e}", file=sys.stderr)
     if PREFS_PATH.exists():
         try:
             return json.loads(PREFS_PATH.read_text())
