@@ -28,6 +28,15 @@ from zoneinfo import ZoneInfo
 URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show-adults=false&zone=reef-left"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+# Travel: from אליהו חכים 8 -> איתן לבני 30, both Tel Aviv.
+# OSRM public demo: free, no key, but uses a static road graph (no live traffic).
+TRAVEL_FROM = (32.126347, 34.801369)   # (lat, lon)
+TRAVEL_TO = (32.043798, 34.802307)
+OSRM_URL = (
+    f"https://router.project-osrm.org/route/v1/driving/"
+    f"{TRAVEL_FROM[1]},{TRAVEL_FROM[0]};{TRAVEL_TO[1]},{TRAVEL_TO[0]}?overview=false"
+)
+
 # (lead minutes before session, minimum spots to alert at that lead)
 # 105m = 1h45 → > 12 spots; 75m = 1h15 → > 10 spots
 LEADS = [
@@ -62,6 +71,25 @@ def in_quiet_hours() -> bool:
     """Active 08:00–18:00 Asia/Jerusalem; quiet otherwise."""
     hour = datetime.now(TZ).hour
     return hour >= 18 or hour < 8
+
+
+def fetch_travel() -> str:
+    """Return human-readable travel-time string, or empty string on failure."""
+    try:
+        req = urllib.request.Request(OSRM_URL, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        route = (data.get("routes") or [{}])[0]
+        secs = route.get("duration")
+        meters = route.get("distance")
+        if secs is None:
+            return ""
+        mins = round(secs / 60)
+        km = (meters or 0) / 1000
+        return f"~{mins} דק' ({km:.1f} ק\"מ, ללא תנועה)"
+    except Exception as e:
+        print(f"travel error: {e}", file=sys.stderr)
+        return ""
 
 
 def fetch_html() -> str:
@@ -159,11 +187,14 @@ def main():
                 continue
 
             mins_to = int(time_until.total_seconds() / 60)
+            travel = fetch_travel()
+            travel_line = f"זמן נסיעה: {travel}\n" if travel else ""
             msg = (
                 f"🏄 <b>Surf Park</b>\n"
                 f"שם הסשן: {s['title']}\n"
                 f"שעה: {s['start'].strftime('%H:%M')} ({s['start'].strftime('%d/%m')}) — בעוד ~{mins_to} דק'\n"
                 f"מקומות פנויים: {s['spots']}\n"
+                f"{travel_line}"
                 f"<a href=\"{URL}\">לרשום עכשיו →</a>"
             )
             telegram_send(msg)
