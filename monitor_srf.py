@@ -249,7 +249,8 @@ def main():
                 continue
 
             mins_to = int(time_until.total_seconds() / 60)
-            travel = fetch_travel()
+            # Travel time only on the closer alert (1:15) — at 1:45 it's too early to matter.
+            travel = fetch_travel() if lead <= 90 else ""
             travel_line = f"זמן נסיעה: {travel}\n" if travel else ""
             msg = (
                 f"🏄 <b>Surf Park</b>\n"
