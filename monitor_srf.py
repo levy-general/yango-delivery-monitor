@@ -67,6 +67,11 @@ HOUR_RE = re.compile(r'<div class="hour">([^<]+)</div>')
 TITLE_RE = re.compile(r'<div class="title">\s*([^<]+?)\s*<')
 
 
+def is_weekend() -> bool:
+    """Skip Friday and Saturday entirely."""
+    return datetime.now(TZ).weekday() in (4, 5)  # Mon=0 ... Fri=4, Sat=5
+
+
 def in_quiet_hours() -> bool:
     """Active 08:00–18:00 Asia/Jerusalem; quiet otherwise."""
     hour = datetime.now(TZ).hour
@@ -157,9 +162,59 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
 
+def daily_summary(sessions: list[dict], state: dict, force: bool = False) -> None:
+    """Send tomorrow's L6-left session summary at ~20:00, except on Thu (don't
+    summarize Fri sessions = none) and Fri (don't summarize Sat sessions = none).
+    Each day at most one summary is sent."""
+    now = datetime.now(TZ)
+    today = now.date().isoformat()
+
+    if not force:
+        # Window: 19:55–20:30 Israel time (covers GH Actions cron jitter)
+        h, m = now.hour, now.minute
+        in_window = (h == 19 and m >= 55) or (h == 20 and m <= 30)
+        if not in_window:
+            return
+        # Skip Thursday (weekday 3) and Friday (weekday 4) — no Fri/Sat sessions to report
+        if now.weekday() in (3, 4):
+            return
+        if state.get("last_summary_date") == today:
+            return
+
+    tomorrow = (now + timedelta(days=1)).date()
+    todays = [s for s in sessions
+              if s["level"] == 6 and "left" in s["area"].lower()
+              and s["start"].date() == tomorrow]
+    todays.sort(key=lambda s: s["start"])
+
+    weekday_he = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"][tomorrow.weekday()]
+    header = f"📅 <b>Surf Park — סשני L6 שמאל ליום {weekday_he} ({tomorrow.strftime('%d/%m')})</b>\n"
+    if not todays:
+        body = "אין סשנים מחר."
+    else:
+        body = "\n".join(
+            f"• {s['start'].strftime('%H:%M')} — {s['title']} — נותרו {s['spots']} מקומות"
+            for s in todays
+        )
+    telegram_send(header + body)
+    state["last_summary_date"] = today
+    print(f"  → Daily summary sent for {tomorrow.isoformat()} ({len(todays)} sessions)")
+
+
 def main():
+    if is_weekend():
+        print("Weekend (Fri/Sat) — skipping.")
+        return
     if in_quiet_hours():
-        print("Quiet hours (18:00–08:00 Asia/Jerusalem) — skipping.")
+        print("Quiet hours (18:00–08:00 Asia/Jerusalem) — skipping alerts.")
+        # Daily summary at ~20:00 — fall through to summary logic below.
+        state = load_state()
+        try:
+            sessions = parse_sessions(fetch_html())
+            daily_summary(sessions, state)
+            save_state(state)
+        except Exception as e:
+            print(f"summary error: {e}", file=sys.stderr)
         return
 
     state = load_state()
@@ -168,6 +223,7 @@ def main():
     html = fetch_html()
     sessions = parse_sessions(html)
     print(f"Parsed {len(sessions)} sessions.")
+    daily_summary(sessions, state)
 
     now = datetime.now(TZ)
     window = timedelta(minutes=WINDOW_MIN)
