@@ -156,9 +156,10 @@ def main():
             continue
 
         msg = (
-            f"🏄 <b>Surf Park — סשן L6 שמאל פנוי!</b>\n"
-            f"שעה: <b>{s['start'].strftime('%H:%M')}</b> ({s['start'].strftime('%d/%m')})\n"
-            f"מקומות פנויים: <b>{s['spots']}</b> (סף: {THRESHOLD})\n"
+            f"🏄 <b>Surf Park</b>\n"
+            f"שם הסשן: {s['title']}\n"
+            f"שעה: {s['start'].strftime('%H:%M')} ({s['start'].strftime('%d/%m')})\n"
+            f"מקומות פנויים: {s['spots']}\n"
             f"<a href=\"{URL}\">לרשום עכשיו →</a>"
         )
         telegram_send(msg)

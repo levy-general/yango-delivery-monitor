@@ -174,25 +174,27 @@ def main():
     # Notify on threshold crossing
     if now_below and not prev_below:
         telegram_send(
-            f"🟢 <b>Yango Deli — מחיר משלוח ירד!</b>\n"
+            f"🟢 <b>Yango Deli</b>\n"
+            f"מחיר משלוח ירד!\n"
             f"כתובת: {ADDR_LABEL}\n"
-            f"דמי משלוח: <b>{cost_str}</b> (סף התראה: {THRESHOLD:g} ₪)\n"
+            f"דמי משלוח: {cost_str}\n"
             f"מינימום הזמנה: {min_str}"
         )
     elif (not now_below) and prev_below:
         telegram_send(
-            f"🔴 <b>Yango Deli — חזר למחיר רגיל</b>\n"
+            f"🔴 <b>Yango Deli</b>\n"
+            f"חזר למחיר רגיל\n"
             f"כתובת: {ADDR_LABEL}\n"
-            f"דמי משלוח: <b>{cost_str}</b>\n"
+            f"דמי משלוח: {cost_str}\n"
             f"מינימום הזמנה: {min_str}"
         )
-    elif prev_cost is not None and prev_cost != cost:
-        # Cost changed but didn't cross threshold — informational only when below
-        if now_below:
-            telegram_send(
-                f"ℹ️ Yango Deli — דמי המשלוח השתנו: {prev_cost} ₪ → <b>{cost_str}</b>\n"
-                f"מינימום הזמנה: {min_str}"
-            )
+    elif prev_cost is not None and prev_cost != cost and now_below:
+        telegram_send(
+            f"ℹ️ <b>Yango Deli</b>\n"
+            f"דמי משלוח השתנו: {prev_cost} ₪ → {cost_str}\n"
+            f"כתובת: {ADDR_LABEL}\n"
+            f"מינימום הזמנה: {min_str}"
+        )
 
     state.update({
         "deliveryCost": cost,
