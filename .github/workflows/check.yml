@@ -50,12 +50,17 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor_srf.py
 
+      - name: Run bot poller
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python bot_poll.py
+
       - name: Commit updated state
         run: |
           git config user.name "monitor-bot"
           git config user.email "monitor-bot@users.noreply.github.com"
           changed=0
-          for f in state.json srf_state.json; do
+          for f in state.json srf_state.json bot_state.json prefs.json; do
             if [[ -f "$f" && -n "$(git status --porcelain "$f")" ]]; then
               git add "$f"
               changed=1

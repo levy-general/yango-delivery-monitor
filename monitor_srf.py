@@ -40,6 +40,28 @@ LEADS = [
 ]
 WINDOW_MIN = int(os.environ.get("SRF_WINDOW_MINUTES", "8"))  # ±8 min around each lead time
 STATE_PATH = Path(os.environ.get("STATE_PATH", "srf_state.json"))
+PREFS_PATH = Path(os.environ.get("PREFS_PATH", "prefs.json"))
+
+
+def load_prefs() -> dict:
+    if PREFS_PATH.exists():
+        try:
+            return json.loads(PREFS_PATH.read_text())
+        except Exception:
+            pass
+    return {"level": 6, "direction": "left"}
+
+
+def matches_prefs(s: dict, prefs: dict) -> bool:
+    if s["level"] != prefs.get("level", 6):
+        return False
+    direction = prefs.get("direction", "left")
+    area = s["area"].lower()
+    if direction == "left":
+        return "left" in area
+    if direction == "right":
+        return "right" in area
+    return True  # both
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -165,14 +187,16 @@ def daily_summary(sessions: list[dict], state: dict, force: bool = False) -> Non
         if state.get("last_summary_date") == today:
             return
 
+    prefs = load_prefs()
     tomorrow = (now + timedelta(days=1)).date()
-    todays = [s for s in sessions
-              if s["level"] == 6 and "left" in s["area"].lower()
-              and s["start"].date() == tomorrow]
+    todays = [s for s in sessions if matches_prefs(s, prefs) and s["start"].date() == tomorrow]
     todays.sort(key=lambda s: s["start"])
 
+    level = prefs.get("level", 6)
+    direction = prefs.get("direction", "left")
+    side_he = {"right": "ימין", "left": "שמאל", "both": "ימין+שמאל"}[direction]
     weekday_he = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"][tomorrow.weekday()]
-    header = f"📅 <b>Surf Park — סשני L6 שמאל ליום {weekday_he} ({tomorrow.strftime('%d/%m')})</b>\n"
+    header = f"📅 <b>Surf Park — סשני L{level} {side_he} ליום {weekday_he} ({tomorrow.strftime('%d/%m')})</b>\n"
     if not todays:
         body = "אין סשנים מחר."
     else:
@@ -212,20 +236,21 @@ def main():
         return
 
     alerted = set(state.get("alerted_ids", []))
-    print(f"Parsed {len(sessions)} sessions.")
+    prefs = load_prefs()
+    print(f"Parsed {len(sessions)} sessions; prefs={prefs}")
 
     now = datetime.now(TZ)
     window = timedelta(minutes=WINDOW_MIN)
 
     for s in sessions:
-        if s["level"] != 6 or "left" not in s["area"].lower():
+        if not matches_prefs(s, prefs):
             continue
         time_until = s["start"] - now
         for lead, threshold in LEADS:
             target = timedelta(minutes=lead)
             in_window = (target - window) <= time_until <= (target + window)
             key = f"{s['id']}_{lead}"
-            print(f"  L6-left id={s['id']} start={s['start'].strftime('%Y-%m-%d %H:%M')} "
+            print(f"  match id={s['id']} L{s['level']}-{s['area']} start={s['start'].strftime('%Y-%m-%d %H:%M')} "
                   f"spots={s['spots']} lead={lead}m thr>{threshold} "
                   f"in_window={in_window} alerted={key in alerted}")
             if not in_window or s["spots"] <= threshold or key in alerted:
