@@ -28,9 +28,12 @@ from zoneinfo import ZoneInfo
 URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show-adults=false&zone=reef-left"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-THRESHOLD = int(os.environ.get("SRF_THRESHOLD", "12"))
-# Comma-separated lead times in minutes; alert once at each lead window.
-LEAD_MINS = [int(x) for x in os.environ.get("SRF_LEAD_MINUTES", "105,75").split(",")]
+# (lead minutes before session, minimum spots to alert at that lead)
+# 105m = 1h45 → > 12 spots; 75m = 1h15 → > 10 spots
+LEADS = [
+    (int(p.split(":")[0]), int(p.split(":")[1]))
+    for p in os.environ.get("SRF_LEADS", "105:12,75:10").split(",")
+]
 WINDOW_MIN = int(os.environ.get("SRF_WINDOW_MINUTES", "8"))  # ±8 min around each lead time
 STATE_PATH = Path(os.environ.get("STATE_PATH", "srf_state.json"))
 
@@ -145,13 +148,14 @@ def main():
         if s["level"] != 6 or "left" not in s["area"].lower():
             continue
         time_until = s["start"] - now
-        for lead in LEAD_MINS:
+        for lead, threshold in LEADS:
             target = timedelta(minutes=lead)
             in_window = (target - window) <= time_until <= (target + window)
             key = f"{s['id']}_{lead}"
             print(f"  L6-left id={s['id']} start={s['start'].strftime('%Y-%m-%d %H:%M')} "
-                  f"spots={s['spots']} lead={lead}m in_window={in_window} alerted={key in alerted}")
-            if not in_window or s["spots"] <= THRESHOLD or key in alerted:
+                  f"spots={s['spots']} lead={lead}m thr>{threshold} "
+                  f"in_window={in_window} alerted={key in alerted}")
+            if not in_window or s["spots"] <= threshold or key in alerted:
                 continue
 
             mins_to = int(time_until.total_seconds() / 60)
