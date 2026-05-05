@@ -84,15 +84,18 @@ async function mirrorUserToD1(env, chatId, prefs, status) {
   );
 }
 
-async function logSearchD1(env, chatId, cmd, levels, direction, date, matched) {
+async function logSearchD1(env, chatId, cmd, levels, direction, date, matched, available) {
+  // matched = sessions matching the user's filter (regardless of spots).
+  // available = sessions matching AND with spots > 0 (truly bookable).
+  // is_available = 1 only when at least one bookable session existed.
   if (!env.DB) return;
   const u = await d1First(env, "SELECT id FROM users WHERE telegram_id = ?", [chatId]);
   await d1Run(env,
     `INSERT INTO search_logs (user_id, command, requested_levels, requested_direction,
-       requested_date, matched_count, is_available)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       requested_date, matched_count, available_count, is_available)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [u ? u.id : null, cmd, JSON.stringify(levels || []), direction || null,
-     date || null, matched, matched > 0 ? 1 : 0]
+     date || null, matched, available, available > 0 ? 1 : 0]
   );
 }
 
@@ -977,8 +980,9 @@ async function showSessionsForDate(env, chatId, dayKey) {
       s.start > nowMs &&
       sessionDayKey(s) === wantedDay
   );
-  await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length });
-  await logSearchD1(env, chatId, "/date", getLevels(prefs), prefs.direction, dayKey, matching.length);
+  const availableDate = matching.filter((s) => s.spots > 0).length;
+  await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length, available: availableDate });
+  await logSearchD1(env, chatId, "/date", getLevels(prefs), prefs.direction, dayKey, matching.length, availableDate);
   const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   if (!matching.length) return { header, body: "אין סשנים מתאימים בתאריך הזה.", sessions: [] };
   const body = matching.map((s) => fmtSession(s)).join("\n");
@@ -1055,8 +1059,9 @@ async function cmdToday(env, chatId) {
       s.start > nowMs &&
       sessionDayKey(s) === today
   );
-  await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length });
-  await logSearchD1(env, chatId, "/today", getLevels(prefs), prefs.direction, null, matching.length);
+  const availableToday = matching.filter((s) => s.spots > 0).length;
+  await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length, available: availableToday });
+  await logSearchD1(env, chatId, "/today", getLevels(prefs), prefs.direction, null, matching.length, availableToday);
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
     ? matching.map((s) => fmtSession(s)).join("\n")
@@ -1089,8 +1094,9 @@ async function cmdAll(env, chatId) {
   const todays = sessions.filter(
     (s) => s.start > nowMs && sessionDayKey(s) === today
   );
-  await logEvent(env, chatId, "result", { cmd: "/all", matched: todays.length });
-  await logSearchD1(env, chatId, "/all", null, null, null, todays.length);
+  const availableAll = todays.filter((s) => s.spots > 0).length;
+  await logEvent(env, chatId, "result", { cmd: "/all", matched: todays.length, available: availableAll });
+  await logSearchD1(env, chatId, "/all", null, null, null, todays.length, availableAll);
   if (!todays.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
