@@ -175,29 +175,7 @@ function describePrefs(p) {
 
 // ---------- Onboarding state ----------
 // Stored in prefs.pending = "address" | "wave" | "direction" | null
-const ADMIN_PRESET = {
-  address: "אליהו חכים 8, תל אביב",
-  lat: 32.126347,
-  lon: 34.801369,
-};
-
 async function startOnboarding(env, chatId) {
-  // Admin already has a configured address — skip straight to wave selection.
-  if (chatId === ADMIN_CHAT_ID) {
-    const existing = (await getUserPrefs(env, chatId)) || {};
-    const prefs = { ...ADMIN_PRESET, ...existing, pending: null };
-    await setUserPrefs(env, chatId, prefs);
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text:
-        "👋 ברוך הבא חזרה.\n" +
-        `כתובת בית מוגדרת: <b>${prefs.address}</b>\n\nבחר רמת גל:`,
-      parse_mode: "HTML",
-      reply_markup: waveKeyboard(),
-    });
-    return;
-  }
-
   await setUserPrefs(env, chatId, { pending: "address" });
   await tg(env, "sendMessage", {
     chat_id: chatId,
