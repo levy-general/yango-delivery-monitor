@@ -259,7 +259,15 @@ async function handleAddressInput(env, chatId, prefs, text, location) {
 }
 
 // ---------- Commands ----------
-async function cmdStart(env, chatId) {
+async function cmdStart(env, chatId, from) {
+  // Capture identity so /list can show real names later.
+  const prefs = (await getUserPrefs(env, chatId)) || {};
+  if (from) {
+    prefs.first_name = from.first_name || prefs.first_name;
+    prefs.last_name = from.last_name || prefs.last_name;
+    prefs.username = from.username || prefs.username;
+    await setUserPrefs(env, chatId, prefs);
+  }
   await startOnboarding(env, chatId);
 }
 
@@ -551,12 +559,30 @@ async function handleUpdate(env, update) {
     if (parts[0] === "/list") {
       const wl = await getWhitelist(env);
       const users = await getUsers(env);
+      const userPrefs = await Promise.all(
+        wl.map(async (id) => ({ id, p: await getUserPrefs(env, id) }))
+      );
+      const lines = [`👥 <b>משתמשים (${wl.length})</b>`, ""];
+      for (const { id, p } of userPrefs) {
+        const name = ((p && (p.first_name || "") + " " + (p.last_name || "")) || "").trim() || "?";
+        const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
+        const subscribed = users.includes(id) ? "🟢 פעיל" : "⚪️ לא הושלם /start";
+        const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
+        lines.push(`<b>${name}</b>${isAdmin} — ${uname}`);
+        lines.push(`  chat_id: <code>${id}</code> · ${subscribed}`);
+        if (p && p.level) {
+          lines.push(`  הגדרות: L${p.level} ${SIDE_HE[p.direction] || p.direction}`);
+        }
+        if (p && p.address) {
+          lines.push(`  כתובת: ${p.address}`);
+        }
+        lines.push("");
+      }
       await tg(env, "sendMessage", {
         chat_id: chatId,
-        text:
-          `👥 <b>משתמשים מאושרים:</b>\n${wl.join(", ")}\n\n` +
-          `📋 <b>נרשמים פעילים:</b>\n${users.join(", ") || "(אין)"}`,
+        text: lines.join("\n").slice(0, 4090),
         parse_mode: "HTML",
+        disable_web_page_preview: true,
       });
       return;
     }
@@ -616,7 +642,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  if (cmd === "/start") await cmdStart(env, chatId);
+  if (cmd === "/start") await cmdStart(env, chatId, msg.from);
   else if (cmd === "/reset") await cmdReset(env, chatId);
   else if (cmd === "/today") await cmdToday(env, chatId);
   else if (cmd === "/all") await cmdAll(env, chatId);
