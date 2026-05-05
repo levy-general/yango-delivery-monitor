@@ -48,6 +48,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          PUSH_SECRET: ${{ secrets.PUSH_SECRET }}
         run: python monitor_srf.py
 
       - name: Commit updated state

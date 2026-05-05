@@ -73,44 +73,17 @@ function describePrefs(p) {
   return `L${p.level} ${SIDE_HE[p.direction]}`;
 }
 
-// ---------- SRF parsing ----------
-// Returns sessions sorted by start time, each:
-//   { id, level, area, start (ms epoch), spots, title, hour }
-async function fetchSessions() {
-  const res = await fetch(SRF_URL, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
-    },
-  });
-  const html = await res.text();
-  const sessions = [];
-  let m;
-  SESSION_RE.lastIndex = 0;
-  while ((m = SESSION_RE.exec(html)) !== null) {
-    const block = m[0];
-    const rest = m.groups.rest;
-    const d = block.match(DATES_RE);
-    if (!d) continue;
-    const s = rest.match(SPOTS_RE);
-    const t = rest.match(TITLE_RE);
-    // 20260504T140000 → 2026-05-04T14:00:00 (interpret as Asia/Jerusalem local)
-    const iso = `${d[1].slice(0, 4)}-${d[1].slice(4, 6)}-${d[1].slice(
-      6,
-      8
-    )}T${d[1].slice(9, 11)}:${d[1].slice(11, 13)}:00+03:00`;
-    sessions.push({
-      id: m.groups.id,
-      level: parseInt(m.groups.level, 10),
-      area: m.groups.area.trim(),
-      start: new Date(iso).getTime(),
-      spots: s ? parseInt(s[1], 10) : 0,
-      title: t ? t[1].trim() : "",
-    });
+// ---------- SRF sessions (read from KV; pushed there by GH Actions) ----------
+// SRF blocks Cloudflare IPs, so the GH Actions monitor pushes parsed sessions
+// to KV under the "sessions" key after each scrape.
+async function fetchSessions(env) {
+  const raw = await env.KV.get("sessions");
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return [];
   }
-  sessions.sort((a, b) => a.start - b.start);
-  return sessions;
 }
 
 function matchesPrefs(s, prefs) {
@@ -151,7 +124,7 @@ async function cmdReset(env, chatId) {
 
 async function cmdToday(env, chatId) {
   const prefs = await getPrefs(env);
-  const sessions = await fetchSessions();
+  const sessions = await fetchSessions(env);
   const now = new Date();
   const today = new Intl.DateTimeFormat("he-IL", {
     timeZone: "Asia/Jerusalem",
@@ -184,7 +157,7 @@ async function cmdToday(env, chatId) {
 }
 
 async function cmdAll(env, chatId) {
-  const sessions = await fetchSessions();
+  const sessions = await fetchSessions(env);
   const today = new Intl.DateTimeFormat("he-IL", {
     timeZone: "Asia/Jerusalem",
     year: "numeric",
@@ -284,6 +257,31 @@ export default {
     if (url.pathname === "/prefs") {
       const prefs = await getPrefs(env);
       return Response.json(prefs);
+    }
+
+    if (url.pathname === "/sessions" && request.method === "POST") {
+      const auth = request.headers.get("X-Auth") || "";
+      if (!env.PUSH_SECRET || auth !== env.PUSH_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const body = await request.text();
+      await env.KV.put("sessions", body);
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/debug") {
+      const sessions = await fetchSessions(env);
+      const today = new Intl.DateTimeFormat("he-IL", {
+        timeZone: "Asia/Jerusalem",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date());
+      return Response.json({
+        sessionsInKV: sessions.length,
+        today,
+        first: sessions[0] || null,
+      });
     }
 
     if (url.pathname === "/webhook" && request.method === "POST") {

@@ -43,7 +43,45 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", "srf_state.json"))
 PREFS_PATH = Path(os.environ.get("PREFS_PATH", "prefs.json"))
 
 
-PREFS_URL = os.environ.get("PREFS_URL", "https://levy-bot.shayko22.workers.dev/prefs")
+WORKER_URL = os.environ.get("WORKER_URL", "https://levy-bot.shayko22.workers.dev").rstrip("/")
+PREFS_URL = f"{WORKER_URL}/prefs"
+PUSH_URL = f"{WORKER_URL}/sessions"
+PUSH_SECRET = os.environ.get("PUSH_SECRET", "")
+
+
+def push_sessions_to_worker(sessions: list[dict]) -> None:
+    """Mirror the freshly parsed sessions to the CF Worker KV so that the bot's
+    /today and /all commands have data (SRF blocks Cloudflare IPs directly)."""
+    if not PUSH_SECRET:
+        print("PUSH_SECRET not set — skipping push.", file=sys.stderr)
+        return
+    payload = [
+        {
+            "id": s["id"],
+            "level": s["level"],
+            "area": s["area"],
+            "start": int(s["start"].timestamp() * 1000),
+            "spots": s["spots"],
+            "title": s["title"],
+        }
+        for s in sessions
+    ]
+    try:
+        req = urllib.request.Request(
+            PUSH_URL,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Auth": PUSH_SECRET,
+                "User-Agent": "monitor-srf/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+        print(f"Pushed {len(payload)} sessions to worker.")
+    except Exception as e:
+        print(f"push to worker failed: {e}", file=sys.stderr)
 
 
 def load_prefs() -> dict:
@@ -233,6 +271,7 @@ def main():
         print(f"fetch error: {e}", file=sys.stderr)
         return
 
+    push_sessions_to_worker(sessions)
     daily_summary(sessions, state)
 
     if no_alerts_today:
