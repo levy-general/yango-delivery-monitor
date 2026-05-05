@@ -174,15 +174,26 @@ function describePrefs(p) {
 }
 
 // ---------- Onboarding state ----------
-// Stored in prefs.pending = "address" | "wave" | "direction" | null
-async function startOnboarding(env, chatId) {
-  await setUserPrefs(env, chatId, { pending: "address" });
+// Stored in prefs.pending = "name" | "address" | "wave" | "direction" | null
+async function startOnboarding(env, chatId, existingPrefs = null) {
+  const base = existingPrefs || {};
+  await setUserPrefs(env, chatId, { ...base, pending: "name" });
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
       "👋 ברוך הבא ל-<b>Surf Park Alerts</b>!\n\n" +
       "אני שולח התראות לפני סשנים בסרף פארק תל אביב כשנשארו מקומות פנויים.\n\n" +
-      "<b>שלב 1/3:</b> שלח את הכתובת שלך (לחישוב זמן נסיעה).\n" +
+      "<b>שלב 1/4:</b> מה השם המלא שלך?",
+    parse_mode: "HTML",
+    reply_markup: { remove_keyboard: true },
+  });
+}
+
+async function askAddress(env, chatId) {
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "<b>שלב 2/4:</b> שלח את הכתובת שלך (לחישוב זמן נסיעה).\n" +
       "אפשר גם ללחוץ על 📎 ואז על 'Location' כדי לשלוח את המיקום שלך.",
     parse_mode: "HTML",
     reply_markup: {
@@ -247,7 +258,7 @@ async function handleAddressInput(env, chatId, prefs, text, location) {
   // Move to wave selection. Use removeKeyboard to clear the location button.
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `✓ הכתובת נשמרה.\n\n<b>שלב 2/3:</b> באיזו רמת גל?`,
+    text: `✓ הכתובת נשמרה.\n\n<b>שלב 3/4:</b> בחר רמת גל:`,
     parse_mode: "HTML",
     reply_markup: { remove_keyboard: true },
   });
@@ -258,17 +269,30 @@ async function handleAddressInput(env, chatId, prefs, text, location) {
   });
 }
 
+async function handleNameInput(env, chatId, prefs, text) {
+  const name = text.trim();
+  if (name.length < 2 || name.length > 60) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "השם נראה לא תקין. תכתוב שם פרטי + משפחה (2–60 תווים).",
+    });
+    return;
+  }
+  prefs.full_name = name;
+  prefs.pending = "address";
+  await setUserPrefs(env, chatId, prefs);
+  await askAddress(env, chatId);
+}
+
 // ---------- Commands ----------
 async function cmdStart(env, chatId, from) {
-  // Capture identity so /list can show real names later.
+  // Capture Telegram identity (handle is needed for /list); the user will
+  // also enter their full name as step 1.
   const prefs = (await getUserPrefs(env, chatId)) || {};
   if (from) {
-    prefs.first_name = from.first_name || prefs.first_name;
-    prefs.last_name = from.last_name || prefs.last_name;
     prefs.username = from.username || prefs.username;
-    await setUserPrefs(env, chatId, prefs);
   }
-  await startOnboarding(env, chatId);
+  await startOnboarding(env, chatId, prefs);
 }
 
 async function cmdReset(env, chatId) {
@@ -515,7 +539,7 @@ async function handleUpdate(env, update) {
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: msgId,
-        text: `רמת גל: <b>L${level}</b>\n<b>שלב 3/3:</b> בחר כיוון:`,
+        text: `רמת גל: <b>L${level}</b>\n<b>שלב 4/4:</b> בחר כיוון:`,
         parse_mode: "HTML",
         reply_markup: dirKeyboard(level),
       });
@@ -564,7 +588,7 @@ async function handleUpdate(env, update) {
       );
       const lines = [`👥 <b>משתמשים (${wl.length})</b>`, ""];
       for (const { id, p } of userPrefs) {
-        const name = ((p && (p.first_name || "") + " " + (p.last_name || "")) || "").trim() || "?";
+        const name = (p && p.full_name) || "(לא הזין שם)";
         const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
         const subscribed = users.includes(id) ? "🟢 פעיל" : "⚪️ לא הושלם /start";
         const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
@@ -627,8 +651,12 @@ async function handleUpdate(env, update) {
     return;
   }
 
-  // If the user is mid-onboarding (waiting for address), handle non-command input.
+  // Mid-onboarding handlers — accept free-text input depending on stage.
   const prefs = (await getUserPrefs(env, chatId)) || {};
+  if (prefs.pending === "name" && text && !text.startsWith("/")) {
+    await handleNameInput(env, chatId, prefs, text);
+    return;
+  }
   if (prefs.pending === "address") {
     if (msg.location) {
       await handleAddressInput(env, chatId, prefs, null, msg.location);
@@ -638,7 +666,6 @@ async function handleUpdate(env, update) {
       await handleAddressInput(env, chatId, prefs, text, null);
       return;
     }
-    // fallthrough to command handling
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
