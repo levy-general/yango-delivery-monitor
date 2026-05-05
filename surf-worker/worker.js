@@ -666,11 +666,24 @@ async function askAddress(env, chatId) {
   });
 }
 
-// 7-day picker for /date.
-function dateKeyboard() {
+// 7-day picker for /date — skip days that have no future sessions in KV.
+async function dateKeyboard(env) {
+  const sessions = (await getSessions(env)) || [];
+  const nowMs = Date.now();
+  // Determine which day-keys actually have at least one upcoming session.
+  const dayKeysWithFuture = new Set();
+  for (const s of sessions) {
+    if (s.start <= nowMs) continue;
+    const k = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(new Date(s.start)).replace(/-/g, "");
+    dayKeysWithFuture.add(k);
+  }
+
   const rows = [];
   const now = new Date();
-  for (let i = 0; i < 7; i++) {
+  // Look up to 14 days ahead, but only emit rows for days with sessions, capped at 7.
+  for (let i = 0; i < 14 && rows.length < 7; i++) {
     const d = new Date(now.getTime() + i * 86400000);
     const ilParts = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem",
@@ -683,9 +696,25 @@ function dateKeyboard() {
     const month = ilParts.find((p) => p.type === "month").value;
     const year = ilParts.find((p) => p.type === "year").value;
     const wd = ilParts.find((p) => p.type === "weekday").value;
-    const label = i === 0 ? `היום (${day}/${month})` : i === 1 ? `מחר (${day}/${month})` : `${wd} ${day}/${month}`;
     const key = `${year}${month}${day}`;
+    if (!dayKeysWithFuture.has(key)) continue;  // skip empty days
+    // i can be > 0 even when "today" was skipped; relabel by date proximity.
+    const label = `${wd} ${day}/${month}`;
     rows.push([{ text: label, callback_data: `date:${key}` }]);
+  }
+  // Fallback: nothing in KV at all → show next 7 days regardless.
+  if (!rows.length) {
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(now.getTime() + i * 86400000);
+      const ilParts = new Intl.DateTimeFormat("he-IL", {
+        timeZone: "Asia/Jerusalem", weekday: "long", day: "2-digit", month: "2-digit", year: "numeric",
+      }).formatToParts(d);
+      const day = ilParts.find((p) => p.type === "day").value;
+      const month = ilParts.find((p) => p.type === "month").value;
+      const year = ilParts.find((p) => p.type === "year").value;
+      const wd = ilParts.find((p) => p.type === "weekday").value;
+      rows.push([{ text: `${wd} ${day}/${month}`, callback_data: `date:${year}${month}${day}` }]);
+    }
   }
   return { inline_keyboard: rows };
 }
@@ -923,7 +952,7 @@ async function cmdDate(env, chatId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text: "בחר תאריך:",
-    reply_markup: dateKeyboard(),
+    reply_markup: await dateKeyboard(env),
   });
 }
 
@@ -1281,7 +1310,7 @@ async function handleUpdate(env, update) {
           message_id: msgId,
           text: result.header + result.body,
           parse_mode: "HTML",
-          reply_markup: dateKeyboard(),
+          reply_markup: await dateKeyboard(env),
         });
         const prefs = await getUserPrefs(env, chatId);
         if (result.sessions && result.sessions.length) {
