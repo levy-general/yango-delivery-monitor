@@ -133,8 +133,10 @@ async function cmdToday(env, chatId) {
     day: "2-digit",
   }).format(now);
 
+  const nowMs = Date.now();
   const matching = sessions.filter((s) => {
     if (!matchesPrefs(s, prefs)) return false;
+    if (s.start <= nowMs) return false;  // skip sessions that already started
     const d = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem",
       year: "numeric",
@@ -165,7 +167,9 @@ async function cmdAll(env, chatId) {
     day: "2-digit",
   }).format(new Date());
 
+  const nowMs = Date.now();
   const todays = sessions.filter((s) => {
+    if (s.start <= nowMs) return false;  // skip sessions that already started
     const d = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem",
       year: "numeric",
