@@ -255,13 +255,14 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
                 if eta:
                     travel_line = f"זמן נסיעה: {eta}\n"
 
+            register_url = f"{WORKER_URL}/r/{chat_id}/{s['id']}?lead={lead}"
             msg = (
                 f"🏄 <b>Surf Park</b>\n"
                 f"שם הסשן: {s['title']}\n"
                 f"שעה: {s['start'].strftime('%H:%M')} ({s['start'].strftime('%d/%m')}) — בעוד ~{mins_to} דק'\n"
                 f"מקומות פנויים: {s['spots']}\n"
                 f"{travel_line}"
-                f"<a href=\"{URL}\">לרשום עכשיו →</a>"
+                f"<a href=\"{register_url}\">לרשום עכשיו →</a>"
             )
             telegram_send(chat_id, msg)
             alerted.add(key)

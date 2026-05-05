@@ -17,6 +17,7 @@
 const SIDE_HE = { right: "ימין", left: "שמאל", both: "ימין+שמאל" };
 const WAVE_LEVELS = [1, 2, 3, 4, 5, 6];
 const ADMIN_CHAT_ID = 328859712;  // Shay — sole admin; can approve new users.
+const SRF_URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show-adults=false&zone=reef-left";
 
 // ---------- Telegram ----------
 async function tg(env, method, payload) {
@@ -120,6 +121,19 @@ function computeStats(events) {
     }
     if (e.action === "address_input" && e.text) addressInputs.push(e.text);
   }
+  // "Probable registrations" — for each click we recorded, find a later
+  // sessions-snapshot event in the events log to compare spots.
+  // (Approximation only; SRF doesn't expose actual booking confirmations.)
+  let clickCount = 0, probableRegistrations = 0;
+  for (const e of events) {
+    if (e.action === "click") {
+      clickCount++;
+      if (e.session_spots_at_click != null) {
+        // We don't have post-click spots in events; the inference happens
+        // during analytics post-processing on the JSON dump.
+      }
+    }
+  }
   const activeDays = Object.keys(byDate).length;
   const totalEvents = events.length;
   return {
@@ -136,6 +150,7 @@ function computeStats(events) {
     results: { empty: resultsEmpty, hits: resultsHits },
     dates_picked: datesPicked,
     address_inputs: addressInputs,
+    alert_clicks: clickCount,
   };
 }
 
@@ -1176,6 +1191,21 @@ export default {
     if (url.pathname.startsWith("/user/")) {
       const id = parseInt(url.pathname.split("/")[2], 10);
       return Response.json(await getUserPrefs(env, id));
+    }
+
+    // Click-tracking redirect for alert links.
+    // /r/<chat_id>/<session_id> → log click then 302 to SRF Park.
+    const m = url.pathname.match(/^\/r\/(\d+)\/([^/]+)$/);
+    if (m) {
+      const chatId = parseInt(m[1], 10);
+      const sessionId = m[2];
+      const lead = url.searchParams.get("lead") || "";
+      // Look up session details from KV (best-effort) for richer logging.
+      const sessions = await getSessions(env);
+      const s = sessions.find((x) => x.id === sessionId);
+      const detail = s ? { session_id: sessionId, session_start: s.start, session_spots_at_click: s.spots, level: s.level, area: s.area, lead } : { session_id: sessionId, lead };
+      await logEvent(env, chatId, "click", detail);
+      return Response.redirect(SRF_URL, 302);
     }
 
     if (url.pathname === "/events") {
