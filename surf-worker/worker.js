@@ -204,12 +204,11 @@ async function askAddress(env, chatId) {
   });
 }
 
-// 7-day picker for /date.
+// 7-day picker for /date — Fri (closed) and Sat (closed) are skipped.
 function dateKeyboard() {
-  const days = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"];
   const rows = [];
   const now = new Date();
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 8; i++) {
     const d = new Date(now.getTime() + i * 86400000);
     const ilParts = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem",
@@ -222,9 +221,12 @@ function dateKeyboard() {
     const month = ilParts.find((p) => p.type === "month").value;
     const year = ilParts.find((p) => p.type === "year").value;
     const wd = ilParts.find((p) => p.type === "weekday").value;
+    // Asia/Jerusalem weekday: detect via formatted name (handles DST/edge cases).
+    if (wd === "יום שישי" || wd === "יום שבת" || wd === "שישי" || wd === "שבת") continue;
     const label = i === 0 ? `היום (${day}/${month})` : i === 1 ? `מחר (${day}/${month})` : `${wd} ${day}/${month}`;
     const key = `${year}${month}${day}`;
     rows.push([{ text: label, callback_data: `date:${key}` }]);
+    if (rows.length >= 7) break;
   }
   return { inline_keyboard: rows };
 }
