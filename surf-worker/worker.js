@@ -739,21 +739,23 @@ async function showSessionsForDate(env, chatId, dayKey) {
 }
 
 // One inline-keyboard button per session — opens the tracked registration link.
-function sessionsKeyboard(chatId, sessions, workerOrigin) {
-  // Title is the most useful identifier (multiple wave types per L). Side and
-  // level are implied by the title and shown in the message above.
+function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
+  // Each row identifies time, level, (side if user wanted both), title, capacity.
+  const showSide = (prefs.direction === "both");
   const rows = sessions.slice(0, 25).map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
-    // Drop a redundant "L<level> - " prefix the SRF site sometimes uses,
-    // since we always render the same level filter.
+    const side = s.area.toLowerCase().includes("left") ? "שמ" : "ימ";
     const cleanTitle = (s.title || "").replace(/^L\d+\s*[-–—]\s*/, "").trim();
-    const TITLE_MAX = 28;
-    const title = cleanTitle.length > TITLE_MAX
-      ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
+    // Budget the remaining width on the title.
+    const lvlPart = `L${s.level}` + (showSide ? side : "");
+    const fixed = `📝 ${time} · ${lvlPart} ·  · ${s.spots} פנוי`.length;  // rough
+    const titleMax = Math.max(8, 50 - fixed);
+    const title = cleanTitle.length > titleMax
+      ? cleanTitle.slice(0, titleMax - 1) + "…"
       : cleanTitle;
-    const label = `📝 ${time} · ${title} · ${s.spots} פנוי`;
+    const label = `📝 ${time} · ${lvlPart} · ${title} · ${s.spots} פנוי`;
     return [{ text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
   });
   return { inline_keyboard: rows };
@@ -821,7 +823,7 @@ async function cmdToday(env, chatId) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "👇 בחר סשן להרשמה",
-      reply_markup: sessionsKeyboard(chatId, matching, "https://surf-bot.shayko22.workers.dev"),
+      reply_markup: sessionsKeyboard(chatId, matching, "https://surf-bot.shayko22.workers.dev", prefs),
     });
   }
 }
@@ -1032,10 +1034,11 @@ async function handleUpdate(env, update) {
           reply_markup: dateKeyboard(),
         });
         if (result.sessions && result.sessions.length) {
+          const prefs = await getUserPrefs(env, chatId);
           await tg(env, "sendMessage", {
             chat_id: chatId,
             text: "👇 בחר סשן להרשמה",
-            reply_markup: sessionsKeyboard(chatId, result.sessions, origin),
+            reply_markup: sessionsKeyboard(chatId, result.sessions, origin, prefs),
           });
         }
       }
