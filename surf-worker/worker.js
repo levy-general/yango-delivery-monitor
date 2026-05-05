@@ -125,25 +125,43 @@ async function userStatus(env, id) {
   return { status: "מוקפא", dot: "🔴" };
 }
 
-function userActionKeyboard(id, status) {
+function contactButton(id, p) {
+  // Prefer username deep-link (works everywhere); fall back to user-id link.
+  const url = p && p.username
+    ? `https://t.me/${p.username}`
+    : `tg://user?id=${id}`;
+  return { text: "💬 פנה למשתמש", url };
+}
+
+function userActionKeyboard(id, status, p) {
   if (id === ADMIN_CHAT_ID) return undefined;  // admin has no actions
+  const contact = contactButton(id, p);
   if (status === "ממתין לאישור") {
-    return { inline_keyboard: [[
-      { text: "✅ אשר", callback_data: `uapprove:${id}` },
-      { text: "❌ דחה", callback_data: `udeny:${id}` },
-    ]] };
+    return { inline_keyboard: [
+      [contact],
+      [
+        { text: "✅ אשר", callback_data: `uapprove:${id}` },
+        { text: "❌ דחה", callback_data: `udeny:${id}` },
+      ],
+    ] };
   }
   if (status === "פעיל") {
-    return { inline_keyboard: [[
-      { text: "🔴 הקפא", callback_data: `ufreeze:${id}` },
-      { text: "🗑 מחק", callback_data: `udelete:${id}` },
-    ]] };
+    return { inline_keyboard: [
+      [contact],
+      [
+        { text: "🔴 הקפא", callback_data: `ufreeze:${id}` },
+        { text: "🗑 מחק", callback_data: `udelete:${id}` },
+      ],
+    ] };
   }
   // frozen
-  return { inline_keyboard: [[
-    { text: "🟢 הפעל מחדש", callback_data: `uactivate:${id}` },
-    { text: "🗑 מחק", callback_data: `udelete:${id}` },
-  ]] };
+  return { inline_keyboard: [
+    [contact],
+    [
+      { text: "🟢 הפעל מחדש", callback_data: `uactivate:${id}` },
+      { text: "🗑 מחק", callback_data: `udelete:${id}` },
+    ],
+  ] };
 }
 
 function renderUserBlock(id, p, status, dot) {
@@ -189,7 +207,7 @@ async function renderUserList(env, chatId) {
       chat_id: chatId,
       text: renderUserBlock(id, p, status, dot),
       parse_mode: "HTML",
-      reply_markup: userActionKeyboard(id, status),
+      reply_markup: userActionKeyboard(id, status, p),
     });
   }
 }
@@ -721,16 +739,20 @@ async function handleUpdate(env, update) {
         await env.KV.put("known_users", JSON.stringify((await getKnownUsers(env)).filter((x) => x !== target)));
         toastMsg = "נמחק";
       }
-      // Refresh the card in place.
-      const p = await getUserPrefs(env, target);
-      const { status, dot } = await userStatus(env, target);
-      await tg(env, "editMessageText", {
-        chat_id: chatId,
-        message_id: msgId,
-        text: renderUserBlock(target, p, status, dot),
-        parse_mode: "HTML",
-        reply_markup: userActionKeyboard(target, status),
-      });
+      // For full removals — drop the card entirely.
+      if (action === "udeny" || action === "udelete") {
+        await tg(env, "deleteMessage", { chat_id: chatId, message_id: msgId });
+      } else {
+        const p = await getUserPrefs(env, target);
+        const { status, dot } = await userStatus(env, target);
+        await tg(env, "editMessageText", {
+          chat_id: chatId,
+          message_id: msgId,
+          text: renderUserBlock(target, p, status, dot),
+          parse_mode: "HTML",
+          reply_markup: userActionKeyboard(target, status, p),
+        });
+      }
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: toastMsg });
       return;
     }
@@ -912,6 +934,22 @@ async function handleUpdate(env, update) {
   const msg = update.message;
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
+
+  // Refresh Telegram identity on every message — usernames may be set later.
+  if (msg.from && (msg.from.username || msg.from.first_name)) {
+    const cur = (await getUserPrefs(env, chatId)) || {};
+    let changed = false;
+    if (msg.from.username && cur.username !== msg.from.username) {
+      cur.username = msg.from.username; changed = true;
+    }
+    if (msg.from.first_name && cur.tg_first_name !== msg.from.first_name) {
+      cur.tg_first_name = msg.from.first_name; changed = true;
+    }
+    if (msg.from.last_name && cur.tg_last_name !== msg.from.last_name) {
+      cur.tg_last_name = msg.from.last_name; changed = true;
+    }
+    if (changed) await setUserPrefs(env, chatId, cur);
+  }
 
   // Admin-only commands
   if (chatId === ADMIN_CHAT_ID && text.startsWith("/")) {
