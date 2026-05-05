@@ -734,19 +734,21 @@ async function showSessionsForDate(env, chatId, dayKey) {
   await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length });
   const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   if (!matching.length) return { header, body: "אין סשנים מתאימים בתאריך הזה.", sessions: [] };
-  const body = "לחיצה על סשן תעביר אותך להרשמה.";
+  const body = matching.map((s) => fmtSession(s)).join("\n");
   return { header, body, sessions: matching };
 }
 
 // One inline-keyboard button per session — opens the tracked registration link.
 function sessionsKeyboard(chatId, sessions, workerOrigin) {
+  // Telegram clamps inline-button text; keep it short. Title appears in the
+  // message text above; the button just identifies the time + capacity.
   const rows = sessions.slice(0, 25).map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
-    const label = `📝 ${time} L${s.level} ${side} (${s.spots} מקומות) — ${s.title}`;
-    return [{ text: label.slice(0, 60), url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
+    const label = `📝 ${time} · L${s.level} ${side} · ${s.spots} מקומות`;
+    return [{ text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
   });
   return { inline_keyboard: rows };
 }
@@ -801,7 +803,7 @@ async function cmdToday(env, chatId) {
   await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length });
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
-    ? "לחיצה על סשן תעביר אותך להרשמה."
+    ? matching.map((s) => fmtSession(s)).join("\n")
     : "אין סשנים מתאימים שנותרו היום.";
   await tg(env, "sendMessage", {
     chat_id: chatId,
