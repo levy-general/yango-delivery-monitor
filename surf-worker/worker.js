@@ -102,6 +102,14 @@ async function revokeUser(env, chatId) {
 
 async function notifyAdminAccessRequest(env, msg) {
   const from = msg.from || {};
+  // Persist whatever Telegram identity we already have so /list shows it
+  // before the user finishes onboarding.
+  const prefs = (await getUserPrefs(env, msg.chat.id)) || {};
+  if (from.username) prefs.username = from.username;
+  if (from.first_name) prefs.tg_first_name = from.first_name;
+  if (from.last_name) prefs.tg_last_name = from.last_name;
+  await setUserPrefs(env, msg.chat.id, prefs);
+
   const uname = from.username ? `@${from.username}` : "(אין שם משתמש)";
   const name = `${from.first_name || ""} ${from.last_name || ""}`.trim();
   await tg(env, "sendMessage", {
@@ -141,19 +149,31 @@ async function geocode(query) {
 }
 
 // ---------- Keyboards ----------
-function waveKeyboard() {
+// Multi-select keyboard: each tap toggles a level; finish with "סיים".
+function waveKeyboard(selected = []) {
+  const sel = new Set(selected);
+  const btn = (n) => ({
+    text: sel.has(n) ? `✓ L${n}` : `L${n}`,
+    callback_data: `wave:${n}`,
+  });
   return {
     inline_keyboard: [
-      WAVE_LEVELS.slice(0, 3).map((n) => ({
-        text: `L${n}`,
-        callback_data: `wave:${n}`,
-      })),
-      WAVE_LEVELS.slice(3).map((n) => ({
-        text: `L${n}`,
-        callback_data: `wave:${n}`,
-      })),
+      WAVE_LEVELS.slice(0, 3).map(btn),
+      WAVE_LEVELS.slice(3).map(btn),
+      [{ text: "✅ סיים", callback_data: "wavedone" }],
     ],
   };
+}
+
+function getLevels(prefs) {
+  // Migration: single `level` → treat as one-element list.
+  if (Array.isArray(prefs.levels) && prefs.levels.length) return prefs.levels;
+  if (prefs.level) return [prefs.level];
+  return [];
+}
+
+function levelsLabel(levels) {
+  return levels.map((n) => `L${n}`).join("+");
 }
 
 function dirKeyboard(level) {
@@ -170,7 +190,17 @@ function dirKeyboard(level) {
 
 function describePrefs(p) {
   const addr = p.address ? `\nכתובת: ${p.address}` : "";
-  return `<b>L${p.level} ${SIDE_HE[p.direction]}</b>${addr}`;
+  const lvl = levelsLabel(getLevels(p));
+  return `<b>${lvl} ${SIDE_HE[p.direction]}</b>${addr}`;
+}
+
+function matchesPrefs(s, prefs) {
+  const levels = getLevels(prefs);
+  if (!levels.includes(s.level)) return false;
+  const a = s.area.toLowerCase();
+  if (prefs.direction === "left") return a.includes("left");
+  if (prefs.direction === "right") return a.includes("right");
+  return true; // both
 }
 
 // ---------- Onboarding state ----------
@@ -229,8 +259,11 @@ function dateKeyboard() {
 }
 
 // Threshold options depend on session capacity: L5/L6 has 15 spots, others 18.
-function thresholdKeyboard(level) {
-  const opts = level >= 5 ? [3, 5, 8, 10, 12, 14] : [3, 5, 10, 14, 16, 17];
+// With multi-select, use the most restrictive (lowest) capacity.
+function thresholdKeyboard(levels) {
+  const ls = Array.isArray(levels) ? levels : [levels];
+  const restrictive = ls.some((l) => l >= 5);
+  const opts = restrictive ? [3, 5, 8, 10, 12, 14] : [3, 5, 10, 14, 16, 17];
   return {
     inline_keyboard: [
       opts.slice(0, 3).map((n) => ({ text: `${n}+`, callback_data: `thr:${n}` })),
@@ -303,21 +336,22 @@ async function cmdStart(env, chatId, from) {
   }
 
   // If everything's already set, skip onboarding and just say hi.
+  const lvls = getLevels(prefs);
   const complete =
     prefs.full_name &&
     prefs.address &&
-    prefs.level &&
+    lvls.length &&
     prefs.direction &&
     prefs.spots_threshold;
   if (complete) {
-    await addUser(env, chatId);  // ensure they're in subscriber list
+    await addUser(env, chatId);
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text:
         `👋 <b>ברוך השב!</b>\n\n` +
         `<b>שם:</b> ${prefs.full_name}\n` +
         `<b>כתובת:</b> ${prefs.address}\n` +
-        `<b>העדפות:</b> L${prefs.level} ${SIDE_HE[prefs.direction]}\n` +
+        `<b>העדפות:</b> ${levelsLabel(lvls)} ${SIDE_HE[prefs.direction]}\n` +
         `<b>סף התראה:</b> מעל ${prefs.spots_threshold} מקומות פנויים\n\n` +
         `<i>/reset לשינוי הגדרות · /help לכל הפקודות</i>`,
       parse_mode: "HTML",
@@ -333,12 +367,12 @@ async function cmdStart(env, chatId, from) {
     prefs.pending = "address";
     await setUserPrefs(env, chatId, prefs);
     await askAddress(env, chatId);
-  } else if (!prefs.level) {
+  } else if (!lvls.length) {
     prefs.pending = null;
     await setUserPrefs(env, chatId, prefs);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: `<b>שלב 3/5:</b> בחר רמת גל:`,
+      text: `<b>שלב 3/5:</b> בחר רמות גל (ניתן לבחור כמה):`,
       parse_mode: "HTML",
       reply_markup: waveKeyboard(),
     });
@@ -347,9 +381,9 @@ async function cmdStart(env, chatId, from) {
     await setUserPrefs(env, chatId, prefs);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: `רמת גל: <b>L${prefs.level}</b>\n<b>שלב 4/5:</b> בחר כיוון:`,
+      text: `רמות: <b>${levelsLabel(lvls)}</b>\n<b>שלב 4/5:</b> בחר כיוון:`,
       parse_mode: "HTML",
-      reply_markup: dirKeyboard(prefs.level),
+      reply_markup: dirKeyboard(0),
     });
   } else if (!prefs.spots_threshold) {
     prefs.pending = null;
@@ -358,7 +392,7 @@ async function cmdStart(env, chatId, from) {
       chat_id: chatId,
       text: `<b>שלב 5/5:</b> מינימום מקומות פנויים להתראה?`,
       parse_mode: "HTML",
-      reply_markup: thresholdKeyboard(prefs.level),
+      reply_markup: thresholdKeyboard(lvls),
     });
   }
 }
@@ -409,7 +443,7 @@ async function cmdDate(env, chatId) {
 
 async function showSessionsForDate(env, chatId, dayKey) {
   const prefs = await getUserPrefs(env, chatId);
-  if (!prefs || !prefs.level) {
+  if (!prefs || !getLevels(prefs).length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "צריך להגדיר קודם — שלח /start.",
@@ -426,32 +460,22 @@ async function showSessionsForDate(env, chatId, dayKey) {
       s.start > nowMs &&
       sessionDayKey(s) === wantedDay
   );
-  const header = `📋 <b>${wantedDay} (L${prefs.level} ${SIDE_HE[prefs.direction]})</b>\n`;
+  const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
-    ? matching.map((s) => fmtSession(s, false)).join("\n")
+    ? matching.map((s) => fmtSession(s)).join("\n")
     : "אין סשנים מתאימים בתאריך הזה.";
   return { header, body };
 }
 
-function fmtSession(s, withSide = true) {
+// Time-only row (date is shown in the header).
+function fmtSession(s) {
   const time = new Intl.DateTimeFormat("he-IL", {
     timeZone: "Asia/Jerusalem",
     hour: "2-digit",
     minute: "2-digit",
-    day: "2-digit",
-    month: "2-digit",
   }).format(new Date(s.start));
   const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
-  const sideStr = withSide ? ` ${side}` : "";
-  return `• ${time}${sideStr} — ${s.title} — נותרו ${s.spots} מקומות`;
-}
-
-function matchesPrefs(s, prefs) {
-  if (s.level !== prefs.level) return false;
-  const a = s.area.toLowerCase();
-  if (prefs.direction === "left") return a.includes("left");
-  if (prefs.direction === "right") return a.includes("right");
-  return true; // both
+  return `• ${time} L${s.level} ${side} — ${s.title} — נותרו ${s.spots} מקומות`;
 }
 
 function todayKeyIL() {
@@ -474,7 +498,7 @@ function sessionDayKey(s) {
 
 async function cmdToday(env, chatId) {
   const prefs = await getUserPrefs(env, chatId);
-  if (!prefs || !prefs.level) {
+  if (!prefs || !getLevels(prefs).length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "צריך להגדיר קודם — שלח /start.",
@@ -490,9 +514,9 @@ async function cmdToday(env, chatId) {
       s.start > nowMs &&
       sessionDayKey(s) === today
   );
-  const header = `📋 <b>סטטוס היום (L${prefs.level} ${SIDE_HE[prefs.direction]})</b>\n`;
+  const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
-    ? matching.map((s) => fmtSession(s, false)).join("\n")
+    ? matching.map((s) => fmtSession(s)).join("\n")
     : "אין סשנים מתאימים שנותרו היום.";
   await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -604,18 +628,41 @@ async function handleUpdate(env, update) {
 
     if (data.startsWith("wave:")) {
       const level = parseInt(data.slice(5), 10);
+      const prefs = (await getUserPrefs(env, chatId)) || {};
+      const cur = new Set(getLevels(prefs));
+      if (cur.has(level)) cur.delete(level);
+      else cur.add(level);
+      prefs.levels = [...cur].sort((a, b) => a - b);
+      delete prefs.level;  // drop legacy field
+      await setUserPrefs(env, chatId, prefs);
+      await tg(env, "editMessageReplyMarkup", {
+        chat_id: chatId,
+        message_id: msgId,
+        reply_markup: waveKeyboard(prefs.levels),
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+    } else if (data === "wavedone") {
+      const prefs = (await getUserPrefs(env, chatId)) || {};
+      const lvls = getLevels(prefs);
+      if (!lvls.length) {
+        await tg(env, "answerCallbackQuery", {
+          callback_query_id: cb.id,
+          text: "צריך לבחור לפחות רמה אחת",
+          show_alert: true,
+        });
+        return;
+      }
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: msgId,
-        text: `רמת גל: <b>L${level}</b>\n<b>שלב 4/5:</b> בחר כיוון:`,
+        text: `רמות: <b>${levelsLabel(lvls)}</b>\n<b>שלב 4/5:</b> בחר כיוון:`,
         parse_mode: "HTML",
-        reply_markup: dirKeyboard(level),
+        reply_markup: dirKeyboard(0),
       });
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
     } else if (data.startsWith("dir:")) {
-      const [, lvl, dir] = data.split(":");
+      const dir = data.split(":")[2];
       const prefs = (await getUserPrefs(env, chatId)) || {};
-      prefs.level = parseInt(lvl, 10);
       prefs.direction = dir;
       await setUserPrefs(env, chatId, prefs);
       await tg(env, "editMessageText", {
@@ -623,7 +670,7 @@ async function handleUpdate(env, update) {
         message_id: msgId,
         text: `כיוון: <b>${SIDE_HE[dir]}</b>\n<b>שלב 5/5:</b> מינימום מקומות פנויים להתראה?`,
         parse_mode: "HTML",
-        reply_markup: thresholdKeyboard(prefs.level),
+        reply_markup: thresholdKeyboard(getLevels(prefs)),
       });
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
     } else if (data.startsWith("thr:")) {
@@ -670,17 +717,23 @@ async function handleUpdate(env, update) {
       );
       const lines = [`👥 <b>משתמשים (${wl.length})</b>`, ""];
       for (const { id, p } of userPrefs) {
-        const name = (p && p.full_name) || "(לא הזין שם)";
+        const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
+        const name = (p && p.full_name) || tgName || "(לא הזין שם)";
         const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
         const subscribed = users.includes(id) ? "🟢 פעיל" : "⚪️ לא הושלם /start";
         const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
+        const lvls = p ? getLevels(p) : [];
         lines.push(`<b>${name}</b>${isAdmin} — ${uname}`);
         lines.push(`  chat_id: <code>${id}</code> · ${subscribed}`);
-        if (p && p.level) {
-          lines.push(`  הגדרות: L${p.level} ${SIDE_HE[p.direction] || p.direction}`);
+        if (lvls.length && p.direction) {
+          lines.push(`  העדפות: ${levelsLabel(lvls)} ${SIDE_HE[p.direction] || p.direction}` +
+            (p.spots_threshold ? `  · סף: ${p.spots_threshold}+` : ""));
         }
         if (p && p.address) {
           lines.push(`  כתובת: ${p.address}`);
+        }
+        if (p && p.cmd_count) {
+          lines.push(`  פקודות שהריץ: ${p.cmd_count}`);
         }
         lines.push("");
       }
@@ -751,6 +804,15 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/help"]);
+  if (KNOWN_CMDS.has(cmd)) {
+    // Track active usage so the admin can see who's actually engaging.
+    const fresh = (await getUserPrefs(env, chatId)) || {};
+    fresh.cmd_count = (fresh.cmd_count || 0) + 1;
+    fresh.last_cmd_at = new Date().toISOString();
+    await setUserPrefs(env, chatId, fresh);
+  }
+
   if (cmd === "/start") await cmdStart(env, chatId, msg.from);
   else if (cmd === "/reset") await cmdReset(env, chatId);
   else if (cmd === "/today") await cmdToday(env, chatId);
