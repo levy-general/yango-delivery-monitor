@@ -32,6 +32,178 @@ async function tg(env, method, payload) {
   return res.json();
 }
 
+// ---------- D1 helpers ----------
+async function d1Run(env, sql, params = []) {
+  if (!env.DB) return { results: [], success: false };
+  try {
+    return await env.DB.prepare(sql).bind(...params).all();
+  } catch (e) {
+    console.error("d1 error:", sql.slice(0, 80), e);
+    return { results: [], success: false };
+  }
+}
+
+async function d1First(env, sql, params = []) {
+  if (!env.DB) return null;
+  try {
+    return await env.DB.prepare(sql).bind(...params).first();
+  } catch (e) {
+    console.error("d1 first error:", e);
+    return null;
+  }
+}
+
+async function mirrorUserToD1(env, chatId, prefs, status) {
+  if (!env.DB) return;
+  const levels = JSON.stringify(getLevels(prefs));
+  await d1Run(env,
+    `INSERT INTO users (telegram_id, full_name, username, tg_first_name, tg_last_name,
+       address, lat, lon, levels, direction, spots_threshold, status, cmd_count,
+       last_cmd_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(telegram_id) DO UPDATE SET
+       full_name = excluded.full_name,
+       username = excluded.username,
+       tg_first_name = excluded.tg_first_name,
+       tg_last_name = excluded.tg_last_name,
+       address = excluded.address,
+       lat = excluded.lat,
+       lon = excluded.lon,
+       levels = excluded.levels,
+       direction = excluded.direction,
+       spots_threshold = excluded.spots_threshold,
+       status = excluded.status,
+       cmd_count = excluded.cmd_count,
+       last_cmd_at = excluded.last_cmd_at,
+       updated_at = datetime('now')`,
+    [chatId, prefs.full_name || null, prefs.username || null,
+     prefs.tg_first_name || null, prefs.tg_last_name || null,
+     prefs.address || null, prefs.lat || null, prefs.lon || null,
+     levels, prefs.direction || null, prefs.spots_threshold || null,
+     status || null, prefs.cmd_count || 0, prefs.last_cmd_at || null]
+  );
+}
+
+async function logSearchD1(env, chatId, cmd, levels, direction, date, matched) {
+  if (!env.DB) return;
+  const u = await d1First(env, "SELECT id FROM users WHERE telegram_id = ?", [chatId]);
+  await d1Run(env,
+    `INSERT INTO search_logs (user_id, command, requested_levels, requested_direction,
+       requested_date, matched_count, is_available)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [u ? u.id : null, cmd, JSON.stringify(levels || []), direction || null,
+     date || null, matched, matched > 0 ? 1 : 0]
+  );
+}
+
+async function pushSessionsHistoryD1(env, sessions) {
+  if (!env.DB || !sessions.length) return;
+  // Batch in chunks of 50 to keep statements small.
+  for (let i = 0; i < sessions.length; i += 50) {
+    const chunk = sessions.slice(i, i + 50);
+    const stmts = chunk.map((s) =>
+      env.DB.prepare(
+        `INSERT INTO sessions_history (session_id, level, area, start_ts, spots, title)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(s.id, s.level, s.area, s.start, s.spots, s.title || "")
+    );
+    try { await env.DB.batch(stmts); } catch (e) { console.error("sh batch:", e); }
+  }
+}
+
+// ---------- Hunt alerts (D1) ----------
+async function addHuntAlert(env, chatId, level, direction, date, time, sessionId) {
+  if (!env.DB) return null;
+  const u = await d1First(env, "SELECT id FROM users WHERE telegram_id = ?", [chatId]);
+  if (!u) return null;
+  const r = await d1Run(env,
+    `INSERT INTO alerts (user_id, level, direction, target_date, target_time, session_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [u.id, level || null, direction || null, date || null, time || null, sessionId || null]
+  );
+  return r;
+}
+
+async function listUserAlerts(env, chatId) {
+  if (!env.DB) return [];
+  const r = await d1Run(env,
+    `SELECT a.id, a.level, a.direction, a.target_date, a.target_time, a.session_id, a.created_at
+     FROM alerts a JOIN users u ON a.user_id = u.id
+     WHERE u.telegram_id = ? AND a.is_active = 1
+     ORDER BY a.created_at DESC`,
+    [chatId]
+  );
+  return r.results || [];
+}
+
+async function cancelAlert(env, chatId, alertId) {
+  if (!env.DB) return;
+  await d1Run(env,
+    `UPDATE alerts SET is_active = 0
+     WHERE id = ? AND user_id = (SELECT id FROM users WHERE telegram_id = ?)`,
+    [alertId, chatId]
+  );
+}
+
+async function fireDueHuntAlerts(env) {
+  if (!env.DB) return 0;
+  const sessions = await getSessions(env);
+  if (!sessions.length) return 0;
+  const r = await d1Run(env,
+    `SELECT a.id AS alert_id, a.level, a.direction, a.target_date, a.target_time,
+       a.session_id, u.telegram_id
+     FROM alerts a JOIN users u ON a.user_id = u.id
+     WHERE a.is_active = 1`);
+  const active = r.results || [];
+  let fired = 0;
+  for (const a of active) {
+    const match = sessions.find((s) => {
+      if (s.spots <= 0) return false;
+      if (a.session_id && a.session_id === s.id) return true;
+      if (a.level && s.level !== a.level) return false;
+      if (a.direction === "left" && !s.area.toLowerCase().includes("left")) return false;
+      if (a.direction === "right" && !s.area.toLowerCase().includes("right")) return false;
+      if (a.target_date) {
+        const d = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(new Date(s.start));
+        if (d !== a.target_date) return false;
+      }
+      if (a.target_time) {
+        const t = new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
+        }).format(new Date(s.start));
+        if (t !== a.target_time) return false;
+      }
+      return true;
+    });
+    if (!match) continue;
+    const time = new Intl.DateTimeFormat("he-IL", {
+      timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
+      day: "2-digit", month: "2-digit",
+    }).format(new Date(match.start));
+    const url = `https://surf-bot.shayko22.workers.dev/r/${a.telegram_id}/${match.id}?lead=hunt`;
+    try {
+      await tg(env, "sendMessage", {
+        chat_id: a.telegram_id,
+        text:
+          `🎯 <b>התפנה מקום!</b>\n` +
+          `${time} · L${match.level} ${match.area.toLowerCase().includes("left") ? "שמאל" : "ימין"}\n` +
+          `${match.title}\n` +
+          `נותרו ${match.spots} מקומות.\n` +
+          `<a href="${url}">לרשום עכשיו →</a>`,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+      await d1Run(env, "UPDATE alerts SET is_active=0, notified_at=datetime('now') WHERE id=?", [a.alert_id]);
+      fired++;
+    } catch (e) {
+      console.error("hunt fire failed:", e);
+    }
+  }
+  return fired;
+}
+
 // ---------- KV helpers ----------
 const userKey = (id) => `user:${id}:prefs`;
 
@@ -42,6 +214,11 @@ async function getUserPrefs(env, chatId) {
 
 async function setUserPrefs(env, chatId, prefs) {
   await env.KV.put(userKey(chatId), JSON.stringify(prefs));
+  // Mirror to D1 for analytics queries.
+  const wl = await getWhitelist(env);
+  const us = await getUsers(env);
+  const status = !wl.includes(chatId) ? "pending" : us.includes(chatId) ? "active" : "frozen";
+  await mirrorUserToD1(env, chatId, prefs, status);
 }
 
 async function deleteUser(env, chatId) {
@@ -691,6 +868,44 @@ async function cmdReset(env, chatId) {
   });
 }
 
+function huntKeyboardForPrefs(prefs, dayKey = null) {
+  const lvls = getLevels(prefs);
+  // Encode level=any for multi-pref, otherwise the single level.
+  const lvl = lvls.length === 1 ? lvls[0] : 0;
+  const dir = prefs.direction || "left";
+  const day = dayKey || "any";
+  return { inline_keyboard: [[
+    { text: "🔔 התראה כשמתפנה", callback_data: `hunt:${lvl}:${dir}:${day}` },
+  ]] };
+}
+
+async function cmdAlerts(env, chatId) {
+  const rows = await listUserAlerts(env, chatId);
+  if (!rows.length) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "אין לך התראות פעילות.\nבחר סשן ב-/today או /date ולחץ '🔔 התראה כשמתפנה'.",
+    });
+    return;
+  }
+  const lines = ["🔔 <b>ההתראות שלך</b>", ""];
+  const buttons = [];
+  for (const a of rows) {
+    const lvl = a.level ? `L${a.level}` : "כל הרמות";
+    const side = a.direction === "left" ? "שמאל" : a.direction === "right" ? "ימין" : "שניהם";
+    const date = a.target_date || "כל יום";
+    const time = a.target_time ? ` ${a.target_time}` : "";
+    lines.push(`#${a.id} · ${lvl} ${side} · ${date}${time}`);
+    buttons.push([{ text: `❌ בטל #${a.id}`, callback_data: `cancelalert:${a.id}` }]);
+  }
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
 async function cmdStop(env, chatId) {
   // Only unsubscribe from alerts; keep the user's prefs so /start later
   // restores them without re-onboarding.
@@ -732,6 +947,7 @@ async function showSessionsForDate(env, chatId, dayKey) {
       sessionDayKey(s) === wantedDay
   );
   await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length });
+  await logSearchD1(env, chatId, "/date", getLevels(prefs), prefs.direction, dayKey, matching.length);
   const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   if (!matching.length) return { header, body: "אין סשנים מתאימים בתאריך הזה.", sessions: [] };
   const body = matching.map((s) => fmtSession(s)).join("\n");
@@ -809,6 +1025,7 @@ async function cmdToday(env, chatId) {
       sessionDayKey(s) === today
   );
   await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length });
+  await logSearchD1(env, chatId, "/today", getLevels(prefs), prefs.direction, null, matching.length);
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
     ? matching.map((s) => fmtSession(s)).join("\n")
@@ -825,6 +1042,12 @@ async function cmdToday(env, chatId) {
       text: "👇 בחר סשן להרשמה",
       reply_markup: sessionsKeyboard(chatId, matching, "https://surf-bot.shayko22.workers.dev", prefs),
     });
+  } else {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "אם תרצה, תקבל התראה ברגע שיתפנה מקום:",
+      reply_markup: huntKeyboardForPrefs(prefs, null),
+    });
   }
 }
 
@@ -836,6 +1059,7 @@ async function cmdAll(env, chatId) {
     (s) => s.start > nowMs && sessionDayKey(s) === today
   );
   await logEvent(env, chatId, "result", { cmd: "/all", matched: todays.length });
+  await logSearchD1(env, chatId, "/all", null, null, null, todays.length);
   if (!todays.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
@@ -868,6 +1092,32 @@ async function handleUpdate(env, update) {
     const chatId = cb.message.chat.id;
     const msgId = cb.message.message_id;
     const data = cb.data || "";
+
+    // Hunt alert: register a "notify when free" request.
+    if (data.startsWith("hunt:")) {
+      const [, lvlStr, dir, day] = data.split(":");
+      const level = parseInt(lvlStr, 10) || null;
+      const target_date = day === "any" ? null : `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)}`;
+      await addHuntAlert(env, chatId, level, dir, target_date, null, null);
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "נרשם!" });
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "🔔 ההתראה נרשמה. ברגע שיתפנה מקום מתאים — אעדכן.\nראה את כל ההתראות שלך ב-/alerts.",
+      });
+      return;
+    }
+
+    if (data.startsWith("cancelalert:")) {
+      const aid = parseInt(data.split(":")[1], 10);
+      await cancelAlert(env, chatId, aid);
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: msgId,
+        text: cb.message.text + `\n\n❌ #${aid} בוטלה.`,
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+      return;
+    }
 
     // Registration self-report from the follow-up survey.
     if (data.startsWith("reg:")) {
@@ -1033,12 +1283,18 @@ async function handleUpdate(env, update) {
           parse_mode: "HTML",
           reply_markup: dateKeyboard(),
         });
+        const prefs = await getUserPrefs(env, chatId);
         if (result.sessions && result.sessions.length) {
-          const prefs = await getUserPrefs(env, chatId);
           await tg(env, "sendMessage", {
             chat_id: chatId,
             text: "👇 בחר סשן להרשמה",
             reply_markup: sessionsKeyboard(chatId, result.sessions, origin, prefs),
+          });
+        } else {
+          await tg(env, "sendMessage", {
+            chat_id: chatId,
+            text: "אם תרצה, תקבל התראה ברגע שיתפנה מקום ביום הזה:",
+            reply_markup: huntKeyboardForPrefs(prefs, dayKey),
           });
         }
       }
@@ -1262,7 +1518,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/alerts"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -1277,13 +1533,17 @@ async function handleUpdate(env, update) {
   else if (cmd === "/all") await cmdAll(env, chatId);
   else if (cmd === "/date") await cmdDate(env, chatId);
   else if (cmd === "/stop") await cmdStop(env, chatId);
+  else if (cmd === "/alerts") await cmdAlerts(env, chatId);
 }
 
 // ---------- Worker entry ----------
 export default {
   async scheduled(event, env, ctx) {
-    // Cron trigger every 5 min — sends due follow-up survey messages.
-    ctx.waitUntil(processDueFollowups(env));
+    // Cron trigger every 5 min — follow-up surveys + hunt-alert dispatch.
+    ctx.waitUntil(Promise.all([
+      processDueFollowups(env),
+      fireDueHuntAlerts(env),
+    ]));
   },
 
   async fetch(request, env) {
@@ -1388,6 +1648,12 @@ export default {
       }
       const body = await request.text();
       await env.KV.put("sessions", body);
+      try {
+        const arr = JSON.parse(body);
+        await pushSessionsHistoryD1(env, arr);
+      } catch (e) {
+        console.error("sessions_history insert:", e);
+      }
       return new Response("ok");
     }
 
