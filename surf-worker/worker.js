@@ -117,6 +117,83 @@ async function revokeUser(env, chatId) {
   await deleteUser(env, chatId);
 }
 
+async function userStatus(env, id) {
+  const wl = await getWhitelist(env);
+  const users = await getUsers(env);
+  if (!wl.includes(id)) return { status: "ממתין לאישור", dot: "🟡" };
+  if (users.includes(id)) return { status: "פעיל", dot: "🟢" };
+  return { status: "מוקפא", dot: "🔴" };
+}
+
+function userActionKeyboard(id, status) {
+  if (id === ADMIN_CHAT_ID) return undefined;  // admin has no actions
+  if (status === "ממתין לאישור") {
+    return { inline_keyboard: [[
+      { text: "✅ אשר", callback_data: `uapprove:${id}` },
+      { text: "❌ דחה", callback_data: `udeny:${id}` },
+    ]] };
+  }
+  if (status === "פעיל") {
+    return { inline_keyboard: [[
+      { text: "🔴 הקפא", callback_data: `ufreeze:${id}` },
+      { text: "🗑 מחק", callback_data: `udelete:${id}` },
+    ]] };
+  }
+  // frozen
+  return { inline_keyboard: [[
+    { text: "🟢 הפעל מחדש", callback_data: `uactivate:${id}` },
+    { text: "🗑 מחק", callback_data: `udelete:${id}` },
+  ]] };
+}
+
+function renderUserBlock(id, p, status, dot) {
+  const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
+  const name = (p && p.full_name) || tgName || "(לא הזין שם)";
+  const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
+  const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
+  const lvls = p ? getLevels(p) : [];
+  const lines = [];
+  lines.push(`${dot} <b>${name}</b>${isAdmin} — ${uname}`);
+  lines.push(`<code>${id}</code> · <i>${status}</i>`);
+  if (lvls.length && p.direction) {
+    lines.push(`העדפות: ${levelsLabel(lvls)} ${SIDE_HE[p.direction] || p.direction}` +
+      (p.spots_threshold ? `  · סף: ${p.spots_threshold}+` : ""));
+  }
+  if (p && p.address) lines.push(`כתובת: ${p.address}`);
+  if (p && p.cmd_count) lines.push(`פקודות: ${p.cmd_count}`);
+  return lines.join("\n");
+}
+
+async function renderUserList(env, chatId) {
+  const wl = await getWhitelist(env);
+  const users = await getUsers(env);
+  const known = await getKnownUsers(env);
+  const all = [...new Set([...known, ...wl])];
+
+  let nG = 0, nY = 0, nR = 0;
+  const items = [];
+  for (const id of all) {
+    const p = await getUserPrefs(env, id);
+    const { status, dot } = await userStatus(env, id);
+    if (dot === "🟢") nG++; else if (dot === "🟡") nY++; else nR++;
+    items.push({ id, p, status, dot });
+  }
+
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🟡 ${nY} · 🔴 ${nR}`,
+    parse_mode: "HTML",
+  });
+  for (const { id, p, status, dot } of items) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: renderUserBlock(id, p, status, dot),
+      parse_mode: "HTML",
+      reply_markup: userActionKeyboard(id, status),
+    });
+  }
+}
+
 async function notifyAdminAccessRequest(env, msg) {
   const from = msg.from || {};
   // Persist whatever Telegram identity we already have so /list shows it
@@ -613,7 +690,52 @@ async function handleUpdate(env, update) {
     const msgId = cb.message.message_id;
     const data = cb.data || "";
 
-    // Admin-only approval buttons
+    // Admin-only user action buttons from /list rendered cards.
+    if (data.startsWith("uapprove:") || data.startsWith("udeny:") ||
+        data.startsWith("ufreeze:") || data.startsWith("uactivate:") ||
+        data.startsWith("udelete:")) {
+      if (chatId !== ADMIN_CHAT_ID) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "אין הרשאה" });
+        return;
+      }
+      const [action, idStr] = data.split(":");
+      const target = parseInt(idStr, 10);
+      let toastMsg = "";
+      if (action === "uapprove") {
+        await approveUser(env, target);
+        toastMsg = "אושר";
+        try { await tg(env, "sendMessage", { chat_id: target, text: "✅ אושרת לגישה לבוט. שלח /start כדי להתחיל." }); } catch (e) {}
+      } else if (action === "udeny") {
+        await env.KV.delete(userKey(target));
+        await env.KV.put("known_users", JSON.stringify((await getKnownUsers(env)).filter((x) => x !== target)));
+        toastMsg = "נדחה";
+      } else if (action === "ufreeze") {
+        await unsubscribeUser(env, target);
+        toastMsg = "הוקפא";
+      } else if (action === "uactivate") {
+        await addUser(env, target);
+        toastMsg = "הופעל";
+      } else if (action === "udelete") {
+        await deleteUser(env, target);
+        await env.KV.put("whitelist", JSON.stringify((await getWhitelist(env)).filter((x) => x !== target)));
+        await env.KV.put("known_users", JSON.stringify((await getKnownUsers(env)).filter((x) => x !== target)));
+        toastMsg = "נמחק";
+      }
+      // Refresh the card in place.
+      const p = await getUserPrefs(env, target);
+      const { status, dot } = await userStatus(env, target);
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: msgId,
+        text: renderUserBlock(target, p, status, dot),
+        parse_mode: "HTML",
+        reply_markup: userActionKeyboard(target, status),
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: toastMsg });
+      return;
+    }
+
+    // Original approval flow from access-request notification.
     if (data.startsWith("approve:") || data.startsWith("deny:")) {
       if (chatId !== ADMIN_CHAT_ID) {
         await tg(env, "answerCallbackQuery", {
@@ -795,49 +917,7 @@ async function handleUpdate(env, update) {
   if (chatId === ADMIN_CHAT_ID && text.startsWith("/")) {
     const parts = text.split(/\s+/);
     if (parts[0] === "/list") {
-      const wl = await getWhitelist(env);
-      const users = await getUsers(env);
-      const known = await getKnownUsers(env);
-      // Show every chat we've ever seen, plus the admin (always whitelisted).
-      const all = [...new Set([...known, ...wl])];
-      const userPrefs = await Promise.all(
-        all.map(async (id) => ({ id, p: await getUserPrefs(env, id) }))
-      );
-
-      let nGreen = 0, nYellow = 0, nRed = 0;
-      const blocks = [];
-      for (const { id, p } of userPrefs) {
-        const inWhitelist = wl.includes(id);
-        const subscribed = users.includes(id);
-        let status, dot;
-        if (!inWhitelist) { status = "ממתין לאישור"; dot = "🟡"; nYellow++; }
-        else if (subscribed) { status = "פעיל"; dot = "🟢"; nGreen++; }
-        else { status = "מוקפא"; dot = "🔴"; nRed++; }
-
-        const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
-        const name = (p && p.full_name) || tgName || "(לא הזין שם)";
-        const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
-        const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
-        const lvls = p ? getLevels(p) : [];
-
-        const lines = [];
-        lines.push(`${dot} <b>${name}</b>${isAdmin} — ${uname}`);
-        lines.push(`  chat_id: <code>${id}</code> · סטטוס: ${status}`);
-        if (lvls.length && p.direction) {
-          lines.push(`  העדפות: ${levelsLabel(lvls)} ${SIDE_HE[p.direction] || p.direction}` +
-            (p.spots_threshold ? `  · סף: ${p.spots_threshold}+` : ""));
-        }
-        if (p && p.address) lines.push(`  כתובת: ${p.address}`);
-        if (p && p.cmd_count) lines.push(`  פקודות שהריץ: ${p.cmd_count}`);
-        blocks.push(lines.join("\n"));
-      }
-      const summary = `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nGreen} · 🟡 ${nYellow} · 🔴 ${nRed}\n`;
-      await tg(env, "sendMessage", {
-        chat_id: chatId,
-        text: (summary + "\n" + blocks.join("\n\n")).slice(0, 4090),
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      });
+      await renderUserList(env, chatId);
       return;
     }
     if (parts[0] === "/revoke" && parts[1]) {
