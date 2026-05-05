@@ -286,13 +286,57 @@ async function handleNameInput(env, chatId, prefs, text) {
 
 // ---------- Commands ----------
 async function cmdStart(env, chatId, from) {
-  // Capture Telegram identity (handle is needed for /list); the user will
-  // also enter their full name as step 1.
   const prefs = (await getUserPrefs(env, chatId)) || {};
   if (from) {
     prefs.username = from.username || prefs.username;
+    await setUserPrefs(env, chatId, prefs);
   }
-  await startOnboarding(env, chatId, prefs);
+
+  // If everything's already set, skip onboarding and just say hi.
+  const complete =
+    prefs.full_name && prefs.address && prefs.level && prefs.direction;
+  if (complete) {
+    await addUser(env, chatId);  // ensure they're in subscriber list
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text:
+        `👋 ברוך הבא חזרה <b>${prefs.full_name}</b>!\n\n` +
+        `הגדרות נוכחיות:\n` +
+        `• רמה: <b>L${prefs.level} ${SIDE_HE[prefs.direction]}</b>\n` +
+        `• כתובת: ${prefs.address}\n\n` +
+        `שלח /reset לשנות הגדרות, /help לכל הפקודות.`,
+      parse_mode: "HTML",
+      reply_markup: { remove_keyboard: true },
+    });
+    return;
+  }
+
+  // Resume from the first missing step.
+  if (!prefs.full_name) {
+    await startOnboarding(env, chatId, prefs);
+  } else if (!prefs.address) {
+    prefs.pending = "address";
+    await setUserPrefs(env, chatId, prefs);
+    await askAddress(env, chatId);
+  } else if (!prefs.level) {
+    prefs.pending = null;
+    await setUserPrefs(env, chatId, prefs);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `<b>שלב 3/4:</b> בחר רמת גל:`,
+      parse_mode: "HTML",
+      reply_markup: waveKeyboard(),
+    });
+  } else if (!prefs.direction) {
+    prefs.pending = null;
+    await setUserPrefs(env, chatId, prefs);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `רמת גל: <b>L${prefs.level}</b>\n<b>שלב 4/4:</b> בחר כיוון:`,
+      parse_mode: "HTML",
+      reply_markup: dirKeyboard(prefs.level),
+    });
+  }
 }
 
 async function cmdReset(env, chatId) {
