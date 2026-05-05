@@ -746,10 +746,10 @@ function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
-    const side = s.area.toLowerCase().includes("left") ? "שמ" : "ימ";
+    const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = (s.title || "").replace(/^L\d+\s*[-–—]\s*/, "").trim();
     // Budget the remaining width on the title.
-    const lvlPart = `L${s.level}` + (showSide ? side : "");
+    const lvlPart = `L${s.level}` + (showSide ? ` ${side}` : "");
     const fixed = `📝 ${time} · ${lvlPart} ·  · ${s.spots} פנוי`.length;  // rough
     const titleMax = Math.max(8, 50 - fixed);
     const title = cleanTitle.length > titleMax
