@@ -69,6 +69,19 @@ async function getUsers(env) {
   return raw ? JSON.parse(raw) : [];
 }
 
+async function getKnownUsers(env) {
+  const raw = await env.KV.get("known_users");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function addKnownUser(env, chatId) {
+  const known = await getKnownUsers(env);
+  if (!known.includes(chatId)) {
+    known.push(chatId);
+    await env.KV.put("known_users", JSON.stringify(known));
+  }
+}
+
 async function getSessions(env) {
   const raw = await env.KV.get("sessions");
   return raw ? JSON.parse(raw) : [];
@@ -113,6 +126,7 @@ async function notifyAdminAccessRequest(env, msg) {
   if (from.first_name) prefs.tg_first_name = from.first_name;
   if (from.last_name) prefs.tg_last_name = from.last_name;
   await setUserPrefs(env, msg.chat.id, prefs);
+  await addKnownUser(env, msg.chat.id);
 
   const uname = from.username ? `@${from.username}` : "(אין שם משתמש)";
   const name = `${from.first_name || ""} ${from.last_name || ""}`.trim();
@@ -783,34 +797,44 @@ async function handleUpdate(env, update) {
     if (parts[0] === "/list") {
       const wl = await getWhitelist(env);
       const users = await getUsers(env);
+      const known = await getKnownUsers(env);
+      // Show every chat we've ever seen, plus the admin (always whitelisted).
+      const all = [...new Set([...known, ...wl])];
       const userPrefs = await Promise.all(
-        wl.map(async (id) => ({ id, p: await getUserPrefs(env, id) }))
+        all.map(async (id) => ({ id, p: await getUserPrefs(env, id) }))
       );
-      const lines = [`👥 <b>משתמשים (${wl.length})</b>`, ""];
+
+      let nGreen = 0, nYellow = 0, nRed = 0;
+      const blocks = [];
       for (const { id, p } of userPrefs) {
+        const inWhitelist = wl.includes(id);
+        const subscribed = users.includes(id);
+        let status, dot;
+        if (!inWhitelist) { status = "ממתין לאישור"; dot = "🟡"; nYellow++; }
+        else if (subscribed) { status = "פעיל"; dot = "🟢"; nGreen++; }
+        else { status = "מוקפא"; dot = "🔴"; nRed++; }
+
         const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
         const name = (p && p.full_name) || tgName || "(לא הזין שם)";
         const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
-        const subscribed = users.includes(id) ? "🟢 פעיל" : "⚪️ לא הושלם /start";
         const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
         const lvls = p ? getLevels(p) : [];
-        lines.push(`<b>${name}</b>${isAdmin} — ${uname}`);
-        lines.push(`  chat_id: <code>${id}</code> · ${subscribed}`);
+
+        const lines = [];
+        lines.push(`${dot} <b>${name}</b>${isAdmin} — ${uname}`);
+        lines.push(`  chat_id: <code>${id}</code> · סטטוס: ${status}`);
         if (lvls.length && p.direction) {
           lines.push(`  העדפות: ${levelsLabel(lvls)} ${SIDE_HE[p.direction] || p.direction}` +
             (p.spots_threshold ? `  · סף: ${p.spots_threshold}+` : ""));
         }
-        if (p && p.address) {
-          lines.push(`  כתובת: ${p.address}`);
-        }
-        if (p && p.cmd_count) {
-          lines.push(`  פקודות שהריץ: ${p.cmd_count}`);
-        }
-        lines.push("");
+        if (p && p.address) lines.push(`  כתובת: ${p.address}`);
+        if (p && p.cmd_count) lines.push(`  פקודות שהריץ: ${p.cmd_count}`);
+        blocks.push(lines.join("\n"));
       }
+      const summary = `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nGreen} · 🟡 ${nYellow} · 🔴 ${nRed}\n`;
       await tg(env, "sendMessage", {
         chat_id: chatId,
-        text: lines.join("\n").slice(0, 4090),
+        text: (summary + "\n" + blocks.join("\n\n")).slice(0, 4090),
         parse_mode: "HTML",
         disable_web_page_preview: true,
       });
