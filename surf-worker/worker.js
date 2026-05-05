@@ -155,10 +155,12 @@ async function fireDueHuntAlerts(env) {
      FROM alerts a JOIN users u ON a.user_id = u.id
      WHERE a.is_active = 1`);
   const active = r.results || [];
+  const nowMs = Date.now();
   let fired = 0;
   for (const a of active) {
     const match = sessions.find((s) => {
       if (s.spots <= 0) return false;
+      if (s.start <= nowMs) return false;  // session already started — not relevant
       if (a.session_id && a.session_id === s.id) return true;
       if (a.level && s.level !== a.level) return false;
       if (a.direction === "left" && !s.area.toLowerCase().includes("left")) return false;
