@@ -90,6 +90,55 @@ async function getEvents(env, chatId) {
   return raw ? JSON.parse(raw) : [];
 }
 
+// Aggregate behavioural signals from raw events for the analytics dump.
+function computeStats(events) {
+  if (!events.length) return null;
+  const tz = "Asia/Jerusalem";
+  const byCmd = {}, byCallback = {}, byHour = {}, byWeekday = {}, byDate = {};
+  const datesPicked = {}, addressInputs = [];
+  let resultsEmpty = 0, resultsHits = 0;
+  let firstTs = null, lastTs = null;
+  for (const e of events) {
+    if (!firstTs || e.ts < firstTs) firstTs = e.ts;
+    if (!lastTs || e.ts > lastTs) lastTs = e.ts;
+    const d = new Date(e.ts);
+    const ilParts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz, hour: "2-digit", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(d);
+    const hour = parseInt(ilParts.find((p) => p.type === "hour").value, 10);
+    const wd = ilParts.find((p) => p.type === "weekday").value;
+    const dayKey = `${ilParts.find((p) => p.type === "year").value}-${ilParts.find((p) => p.type === "month").value}-${ilParts.find((p) => p.type === "day").value}`;
+    byHour[hour] = (byHour[hour] || 0) + 1;
+    byWeekday[wd] = (byWeekday[wd] || 0) + 1;
+    byDate[dayKey] = (byDate[dayKey] || 0) + 1;
+    if (e.action === "command") byCmd[e.cmd] = (byCmd[e.cmd] || 0) + 1;
+    if (e.action === "callback") byCallback[e.data] = (byCallback[e.data] || 0) + 1;
+    if (e.action === "result") {
+      if (e.matched > 0) resultsHits++;
+      else resultsEmpty++;
+      if (e.cmd === "/date" && e.date) datesPicked[e.date] = (datesPicked[e.date] || 0) + 1;
+    }
+    if (e.action === "address_input" && e.text) addressInputs.push(e.text);
+  }
+  const activeDays = Object.keys(byDate).length;
+  const totalEvents = events.length;
+  return {
+    first_event: firstTs,
+    last_event: lastTs,
+    total_events: totalEvents,
+    active_days: activeDays,
+    avg_events_per_active_day: +(totalEvents / activeDays).toFixed(2),
+    by_command: byCmd,
+    by_callback: byCallback,
+    by_hour_il: byHour,
+    by_weekday_il: byWeekday,
+    by_date_il: byDate,
+    results: { empty: resultsEmpty, hits: resultsHits },
+    dates_picked: datesPicked,
+    address_inputs: addressInputs,
+  };
+}
+
 async function getKnownUsers(env) {
   const raw = await env.KV.get("known_users");
   return raw ? JSON.parse(raw) : [];
@@ -624,6 +673,7 @@ async function showSessionsForDate(env, chatId, dayKey) {
       s.start > nowMs &&
       sessionDayKey(s) === wantedDay
   );
+  await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length });
   const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
     ? matching.map((s) => fmtSession(s)).join("\n")
@@ -678,6 +728,7 @@ async function cmdToday(env, chatId) {
       s.start > nowMs &&
       sessionDayKey(s) === today
   );
+  await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length });
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
     ? matching.map((s) => fmtSession(s)).join("\n")
@@ -697,6 +748,7 @@ async function cmdAll(env, chatId) {
   const todays = sessions.filter(
     (s) => s.start > nowMs && sessionDayKey(s) === today
   );
+  await logEvent(env, chatId, "result", { cmd: "/all", matched: todays.length });
   if (!todays.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
@@ -1152,6 +1204,7 @@ export default {
               cmd_count: prefs.cmd_count || 0,
               last_cmd_at: prefs.last_cmd_at,
             },
+            stats: computeStats(events),
             events,
           };
         }
