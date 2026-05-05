@@ -64,5 +64,7 @@ def driving_eta(origin: tuple[float, float], dest: tuple[float, float]) -> str:
         return ""
 
 
+SURF_PARK_COORDS = (32.043798, 34.802307)  # איתן לבני 30, ת"א
+
 if __name__ == "__main__":
-    print(driving_eta((32.126347, 34.801369), (32.043798, 34.802307)))
+    print(driving_eta((32.126347, 34.801369), SURF_PARK_COORDS))
