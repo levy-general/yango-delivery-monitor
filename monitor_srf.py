@@ -76,14 +76,41 @@ def http_json(url: str, **kwargs) -> dict:
     return json.loads(body) if body else {}
 
 
-def fetch_html() -> str:
-    req = urllib.request.Request(URL, headers={
+def _fetch(url: str) -> str:
+    req = urllib.request.Request(url, headers={
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
     })
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read().decode("utf-8", errors="replace")
+
+
+def fetch_html() -> str:
+    """Fetch the default 3-day window (today + 2)."""
+    return _fetch(URL)
+
+
+def fetch_all_windows(days_ahead: int = 9) -> list[dict]:
+    """SRF returns 3 days per page. Paginate via ?from_date= to cover
+    `days_ahead` days. Sessions across all windows are de-duplicated by id."""
+    by_id: dict[str, dict] = {}
+    today = datetime.now(TZ).date()
+    for offset in range(0, days_ahead, 3):
+        d = today + timedelta(days=offset)
+        if offset == 0:
+            url = URL
+        else:
+            from_date = d.strftime("%d/%m/%y")
+            url = f"{URL}&from_date={urllib.parse.quote(from_date)}"
+        try:
+            html = _fetch(url)
+        except Exception as e:
+            print(f"window from_date={d.isoformat()} failed: {e}", file=sys.stderr)
+            continue
+        for s in parse_sessions(html):
+            by_id[s["id"]] = s
+    return sorted(by_id.values(), key=lambda s: s["start"])
 
 
 def parse_sessions(html: str) -> list[dict]:
@@ -311,11 +338,11 @@ def main():
     state = load_state()
 
     try:
-        sessions = parse_sessions(fetch_html())
+        sessions = fetch_all_windows(days_ahead=9)
     except Exception as e:
         print(f"scrape failed: {e}", file=sys.stderr)
         return
-    print(f"Parsed {len(sessions)} sessions.")
+    print(f"Parsed {len(sessions)} sessions across windows.")
 
     push_sessions(sessions)
     users = fetch_users()
