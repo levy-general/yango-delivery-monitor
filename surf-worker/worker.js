@@ -69,6 +69,27 @@ async function getUsers(env) {
   return raw ? JSON.parse(raw) : [];
 }
 
+// ---------- Event log ----------
+const EVENT_CAP = 500;  // last N events kept per user
+
+async function logEvent(env, chatId, action, params = {}) {
+  const key = `events:${chatId}`;
+  const raw = await env.KV.get(key);
+  const events = raw ? JSON.parse(raw) : [];
+  events.push({
+    ts: new Date().toISOString(),
+    action,
+    ...params,
+  });
+  if (events.length > EVENT_CAP) events.splice(0, events.length - EVENT_CAP);
+  await env.KV.put(key, JSON.stringify(events));
+}
+
+async function getEvents(env, chatId) {
+  const raw = await env.KV.get(`events:${chatId}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
 async function getKnownUsers(env) {
   const raw = await env.KV.get("known_users");
   return raw ? JSON.parse(raw) : [];
@@ -398,6 +419,7 @@ async function handleAddressInput(env, chatId, prefs, text, location) {
   }
 
   // Text address — geocode then ask the user to confirm what we resolved.
+  await logEvent(env, chatId, "address_input", { text });
   const g = await geocode(text);
   if (!g) {
     await tg(env, "sendMessage", {
@@ -801,6 +823,12 @@ async function handleUpdate(env, update) {
       return;
     }
 
+    if (data.startsWith("date:") || data.startsWith("wave:") || data === "wavedone" ||
+        data.startsWith("dir:") || data.startsWith("thr:") ||
+        data === "addrok" || data === "addrno") {
+      await logEvent(env, chatId, "callback", { data });
+    }
+
     if (data === "addrok" || data === "addrno") {
       const prefs = (await getUserPrefs(env, chatId)) || {};
       if (data === "addrok") {
@@ -958,6 +986,47 @@ async function handleUpdate(env, update) {
       await renderUserList(env, chatId);
       return;
     }
+    if (parts[0] === "/events" && parts[1]) {
+      const target = parseInt(parts[1], 10);
+      const events = await getEvents(env, target);
+      const last = events.slice(-30).reverse();
+      const tz = "Asia/Jerusalem";
+      const lines = [`📜 <b>אירועים אחרונים — ${target}</b> (סה"כ ${events.length})`, ""];
+      for (const e of last) {
+        const time = new Date(e.ts).toLocaleString("he-IL", { timeZone: tz });
+        const detail = e.cmd || e.data || e.text || "";
+        lines.push(`<code>${time}</code> · ${e.action}${detail ? ` · ${detail}` : ""}`);
+      }
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: lines.join("\n").slice(0, 4090),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    if (parts[0] === "/export") {
+      // Send the user a compact summary; the full JSON is at /events?key=...
+      const known = await getKnownUsers(env);
+      const wl = await getWhitelist(env);
+      const all = [...new Set([...known, ...wl])];
+      const totals = {};
+      for (const id of all) {
+        totals[id] = (await getEvents(env, id)).length;
+      }
+      const total = Object.values(totals).reduce((a, b) => a + b, 0);
+      const lines = [`📦 <b>סיכום אירועים</b> (סה"כ ${total})`, ""];
+      for (const id of all) {
+        if (totals[id]) lines.push(`<code>${id}</code>: ${totals[id]} אירועים`);
+      }
+      lines.push("", `הורדה מלאה: <a href=\"https://surf-bot.shayko22.workers.dev/events?key=PUSH_SECRET\">/events JSON</a>`);
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: lines.join("\n"),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+      return;
+    }
     if (parts[0] === "/revoke" && parts[1]) {
       const target = parseInt(parts[1], 10);
       await revokeUser(env, target);
@@ -1020,11 +1089,11 @@ async function handleUpdate(env, update) {
   const cmd = text.split(/\s+/)[0].split("@")[0];
   const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/help"]);
   if (KNOWN_CMDS.has(cmd)) {
-    // Track active usage so the admin can see who's actually engaging.
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
     fresh.last_cmd_at = new Date().toISOString();
     await setUserPrefs(env, chatId, fresh);
+    await logEvent(env, chatId, "command", { cmd });
   }
 
   if (cmd === "/start") await cmdStart(env, chatId, msg.from);
@@ -1055,6 +1124,44 @@ export default {
     if (url.pathname.startsWith("/user/")) {
       const id = parseInt(url.pathname.split("/")[2], 10);
       return Response.json(await getUserPrefs(env, id));
+    }
+
+    if (url.pathname === "/events") {
+      // Bulk export of every user's events. Protected by the same PUSH_SECRET
+      // already shared with the GH Actions monitor.
+      const key = url.searchParams.get("key") || "";
+      if (!env.PUSH_SECRET || key !== env.PUSH_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const known = await getKnownUsers(env);
+      const wl = await getWhitelist(env);
+      const all = [...new Set([...known, ...wl])];
+      const out = {};
+      for (const id of all) {
+        const prefs = await getUserPrefs(env, id);
+        const events = await getEvents(env, id);
+        if (events.length || prefs) {
+          out[id] = {
+            prefs: prefs && {
+              full_name: prefs.full_name,
+              username: prefs.username,
+              levels: getLevels(prefs),
+              direction: prefs.direction,
+              spots_threshold: prefs.spots_threshold,
+              address: prefs.address,
+              cmd_count: prefs.cmd_count || 0,
+              last_cmd_at: prefs.last_cmd_at,
+            },
+            events,
+          };
+        }
+      }
+      return new Response(JSON.stringify(out, null, 2), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": 'attachment; filename="surf-bot-events.json"',
+        },
+      });
     }
 
     if (url.pathname === "/sessions" && request.method === "POST") {
