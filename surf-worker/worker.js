@@ -183,7 +183,7 @@ async function startOnboarding(env, chatId, existingPrefs = null) {
     text:
       "👋 ברוך הבא ל-<b>Surf Park Alerts</b>!\n\n" +
       "אני שולח התראות לפני סשנים בסרף פארק תל אביב כשנשארו מקומות פנויים.\n\n" +
-      "<b>שלב 1/4:</b> מה השם המלא שלך?",
+      "<b>שלב 1/5:</b> מה השם המלא שלך?",
     parse_mode: "HTML",
     reply_markup: { remove_keyboard: true },
   });
@@ -193,7 +193,7 @@ async function askAddress(env, chatId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
-      "<b>שלב 2/4:</b> שלח את הכתובת שלך (לחישוב זמן נסיעה).\n" +
+      "<b>שלב 2/5:</b> שלח את הכתובת שלך (לחישוב זמן נסיעה).\n" +
       "אפשר גם ללחוץ על 📎 ואז על 'Location' כדי לשלוח את המיקום שלך.",
     parse_mode: "HTML",
     reply_markup: {
@@ -204,11 +204,11 @@ async function askAddress(env, chatId) {
   });
 }
 
-// 7-day picker for /date — Fri (closed) and Sat (closed) are skipped.
+// 7-day picker for /date.
 function dateKeyboard() {
   const rows = [];
   const now = new Date();
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 7; i++) {
     const d = new Date(now.getTime() + i * 86400000);
     const ilParts = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem",
@@ -221,14 +221,22 @@ function dateKeyboard() {
     const month = ilParts.find((p) => p.type === "month").value;
     const year = ilParts.find((p) => p.type === "year").value;
     const wd = ilParts.find((p) => p.type === "weekday").value;
-    // Asia/Jerusalem weekday: detect via formatted name (handles DST/edge cases).
-    if (wd === "יום שישי" || wd === "יום שבת" || wd === "שישי" || wd === "שבת") continue;
     const label = i === 0 ? `היום (${day}/${month})` : i === 1 ? `מחר (${day}/${month})` : `${wd} ${day}/${month}`;
     const key = `${year}${month}${day}`;
     rows.push([{ text: label, callback_data: `date:${key}` }]);
-    if (rows.length >= 7) break;
   }
   return { inline_keyboard: rows };
+}
+
+// Threshold options depend on session capacity: L5/L6 has 15 spots, others 18.
+function thresholdKeyboard(level) {
+  const opts = level >= 5 ? [3, 5, 8, 10, 12, 14] : [3, 5, 10, 14, 16, 17];
+  return {
+    inline_keyboard: [
+      opts.slice(0, 3).map((n) => ({ text: `${n}+`, callback_data: `thr:${n}` })),
+      opts.slice(3).map((n) => ({ text: `${n}+`, callback_data: `thr:${n}` })),
+    ],
+  };
 }
 
 async function handleAddressInput(env, chatId, prefs, text, location) {
@@ -260,7 +268,7 @@ async function handleAddressInput(env, chatId, prefs, text, location) {
   // Move to wave selection. Use removeKeyboard to clear the location button.
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `✓ הכתובת נשמרה.\n\n<b>שלב 3/4:</b> בחר רמת גל:`,
+    text: `✓ הכתובת נשמרה.\n\n<b>שלב 3/5:</b> בחר רמת גל:`,
     parse_mode: "HTML",
     reply_markup: { remove_keyboard: true },
   });
@@ -296,7 +304,11 @@ async function cmdStart(env, chatId, from) {
 
   // If everything's already set, skip onboarding and just say hi.
   const complete =
-    prefs.full_name && prefs.address && prefs.level && prefs.direction;
+    prefs.full_name &&
+    prefs.address &&
+    prefs.level &&
+    prefs.direction &&
+    prefs.spots_threshold;
   if (complete) {
     await addUser(env, chatId);  // ensure they're in subscriber list
     await tg(env, "sendMessage", {
@@ -305,7 +317,8 @@ async function cmdStart(env, chatId, from) {
         `👋 <b>ברוך השב!</b>\n\n` +
         `<b>שם:</b> ${prefs.full_name}\n` +
         `<b>כתובת:</b> ${prefs.address}\n` +
-        `<b>העדפות:</b> L${prefs.level} ${SIDE_HE[prefs.direction]}\n\n` +
+        `<b>העדפות:</b> L${prefs.level} ${SIDE_HE[prefs.direction]}\n` +
+        `<b>סף התראה:</b> מעל ${prefs.spots_threshold} מקומות פנויים\n\n` +
         `<i>/reset לשינוי הגדרות · /help לכל הפקודות</i>`,
       parse_mode: "HTML",
       reply_markup: { remove_keyboard: true },
@@ -325,7 +338,7 @@ async function cmdStart(env, chatId, from) {
     await setUserPrefs(env, chatId, prefs);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: `<b>שלב 3/4:</b> בחר רמת גל:`,
+      text: `<b>שלב 3/5:</b> בחר רמת גל:`,
       parse_mode: "HTML",
       reply_markup: waveKeyboard(),
     });
@@ -334,9 +347,18 @@ async function cmdStart(env, chatId, from) {
     await setUserPrefs(env, chatId, prefs);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: `רמת גל: <b>L${prefs.level}</b>\n<b>שלב 4/4:</b> בחר כיוון:`,
+      text: `רמת גל: <b>L${prefs.level}</b>\n<b>שלב 4/5:</b> בחר כיוון:`,
       parse_mode: "HTML",
       reply_markup: dirKeyboard(prefs.level),
+    });
+  } else if (!prefs.spots_threshold) {
+    prefs.pending = null;
+    await setUserPrefs(env, chatId, prefs);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `<b>שלב 5/5:</b> מינימום מקומות פנויים להתראה?`,
+      parse_mode: "HTML",
+      reply_markup: thresholdKeyboard(prefs.level),
     });
   }
 }
@@ -585,7 +607,7 @@ async function handleUpdate(env, update) {
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: msgId,
-        text: `רמת גל: <b>L${level}</b>\n<b>שלב 4/4:</b> בחר כיוון:`,
+        text: `רמת גל: <b>L${level}</b>\n<b>שלב 4/5:</b> בחר כיוון:`,
         parse_mode: "HTML",
         reply_markup: dirKeyboard(level),
       });
@@ -595,6 +617,19 @@ async function handleUpdate(env, update) {
       const prefs = (await getUserPrefs(env, chatId)) || {};
       prefs.level = parseInt(lvl, 10);
       prefs.direction = dir;
+      await setUserPrefs(env, chatId, prefs);
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: msgId,
+        text: `כיוון: <b>${SIDE_HE[dir]}</b>\n<b>שלב 5/5:</b> מינימום מקומות פנויים להתראה?`,
+        parse_mode: "HTML",
+        reply_markup: thresholdKeyboard(prefs.level),
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+    } else if (data.startsWith("thr:")) {
+      const threshold = parseInt(data.slice(4), 10);
+      const prefs = (await getUserPrefs(env, chatId)) || {};
+      prefs.spots_threshold = threshold;
       prefs.pending = null;
       await setUserPrefs(env, chatId, prefs);
       await addUser(env, chatId);
@@ -603,8 +638,9 @@ async function handleUpdate(env, update) {
         message_id: msgId,
         text:
           `✅ <b>סיימנו!</b>\n\n` +
-          `הגדרות: ${describePrefs(prefs)}\n\n` +
-          `אקבל התראות 1:45 לפני סשן (>12 מקומות) ו-1:15 לפני (>10 מקומות).\n` +
+          `${describePrefs(prefs)}\n` +
+          `סף התראה: <b>מעל ${threshold} מקומות פנויים</b>\n\n` +
+          `אקבל התראות 1:45 ו-1:15 לפני סשנים מתאימים.\n` +
           `שלח /help לכל הפקודות.`,
         parse_mode: "HTML",
       });

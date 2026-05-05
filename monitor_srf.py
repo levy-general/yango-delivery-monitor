@@ -40,8 +40,9 @@ PUSH_SECRET = os.environ.get("SURF_PUSH_SECRET", "")
 
 STATE_PATH = Path(os.environ.get("STATE_PATH", "srf_state.json"))
 
-# Per-lead alert thresholds: (lead minutes, min spots strictly greater than)
-LEADS = [(105, 12), (75, 10)]
+# Lead times in minutes before session start. Threshold (spots strictly
+# greater than) is read from each user's prefs.spots_threshold.
+LEADS = [105, 75]
 WINDOW_MIN = 8
 
 # Session block regex (same as before).
@@ -204,6 +205,7 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
 
     user_state = state.setdefault(str(chat_id), {})
     alerted = set(user_state.get("alerted_ids", []))
+    threshold = int(prefs.get("spots_threshold", 10))
 
     now = datetime.now(TZ)
     window = timedelta(minutes=WINDOW_MIN)
@@ -212,7 +214,7 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
         if not matches_prefs(s, prefs):
             continue
         time_until = s["start"] - now
-        for lead, threshold in LEADS:
+        for lead in LEADS:
             target = timedelta(minutes=lead)
             in_window = (target - window) <= time_until <= (target + window)
             key = f"{s['id']}_{lead}"
