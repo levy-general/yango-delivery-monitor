@@ -91,6 +91,58 @@ async function getEvents(env, chatId) {
   return raw ? JSON.parse(raw) : [];
 }
 
+// ---------- Follow-up queue ----------
+async function queueFollowup(env, item) {
+  const raw = await env.KV.get("followups");
+  const arr = raw ? JSON.parse(raw) : [];
+  // Avoid duplicate queueing for the same chat+session.
+  const key = `${item.chat_id}:${item.session_id}`;
+  if (arr.some((x) => `${x.chat_id}:${x.session_id}` === key)) return;
+  arr.push(item);
+  await env.KV.put("followups", JSON.stringify(arr));
+}
+
+async function getFollowups(env) {
+  const raw = await env.KV.get("followups");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function setFollowups(env, arr) {
+  await env.KV.put("followups", JSON.stringify(arr));
+}
+
+async function processDueFollowups(env) {
+  const now = Date.now();
+  const all = await getFollowups(env);
+  const remaining = [];
+  let sent = 0;
+  for (const f of all) {
+    if (f.due_ts > now) { remaining.push(f); continue; }
+    try {
+      const when = f.session_start
+        ? new Date(f.session_start).toLocaleString("he-IL", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" })
+        : "(לא ידוע)";
+      const title = f.session_title || "סשן";
+      await tg(env, "sendMessage", {
+        chat_id: f.chat_id,
+        text:
+          `🏄 רגע אחרון —\n` +
+          `הצלחת להירשם ל<b>${title}</b> בשעה <b>${when}</b>?`,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[
+          { text: "✅ כן, נרשמתי", callback_data: `reg:yes:${f.session_id}` },
+          { text: "❌ לא", callback_data: `reg:no:${f.session_id}` },
+        ]] },
+      });
+      sent++;
+    } catch (e) {
+      console.error("followup send failed:", e);
+    }
+  }
+  if (sent > 0) await setFollowups(env, remaining);
+  return sent;
+}
+
 // Aggregate behavioural signals from raw events for the analytics dump.
 function computeStats(events) {
   if (!events.length) return null;
@@ -124,14 +176,16 @@ function computeStats(events) {
   // "Probable registrations" — for each click we recorded, find a later
   // sessions-snapshot event in the events log to compare spots.
   // (Approximation only; SRF doesn't expose actual booking confirmations.)
-  let clickCount = 0, probableRegistrations = 0;
+  let clickCount = 0;
+  const clicksBySession = {};       // session_id → spots_at_click
+  let regYes = 0, regNo = 0;
   for (const e of events) {
     if (e.action === "click") {
       clickCount++;
-      if (e.session_spots_at_click != null) {
-        // We don't have post-click spots in events; the inference happens
-        // during analytics post-processing on the JSON dump.
-      }
+      if (e.session_id) clicksBySession[e.session_id] = e.session_spots_at_click;
+    }
+    if (e.action === "registration_report") {
+      if (e.registered) regYes++; else regNo++;
     }
   }
   const activeDays = Object.keys(byDate).length;
@@ -151,6 +205,9 @@ function computeStats(events) {
     dates_picked: datesPicked,
     address_inputs: addressInputs,
     alert_clicks: clickCount,
+    registrations_confirmed: regYes,
+    registrations_declined: regNo,
+    clicks_by_session: clicksBySession,
   };
 }
 
@@ -797,6 +854,21 @@ async function handleUpdate(env, update) {
     const msgId = cb.message.message_id;
     const data = cb.data || "";
 
+    // Registration self-report from the follow-up survey.
+    if (data.startsWith("reg:")) {
+      const [, answer, sessionId] = data.split(":");
+      await logEvent(env, chatId, "registration_report", { session_id: sessionId, registered: answer === "yes" });
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: msgId,
+        text: answer === "yes"
+          ? "🙌 מעולה — תודה על העדכון! נמשיך לשלוח לך התראות."
+          : "תודה על העדכון. אם משהו לא טוב — /reset לעדכן הגדרות.",
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+      return;
+    }
+
     // Admin-only user action buttons from /list rendered cards.
     if (data.startsWith("uapprove:") || data.startsWith("udeny:") ||
         data.startsWith("ufreeze:") || data.startsWith("uactivate:") ||
@@ -1174,6 +1246,11 @@ async function handleUpdate(env, update) {
 
 // ---------- Worker entry ----------
 export default {
+  async scheduled(event, env, ctx) {
+    // Cron trigger every 5 min — sends due follow-up survey messages.
+    ctx.waitUntil(processDueFollowups(env));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -1200,11 +1277,15 @@ export default {
       const chatId = parseInt(m[1], 10);
       const sessionId = m[2];
       const lead = url.searchParams.get("lead") || "";
-      // Look up session details from KV (best-effort) for richer logging.
       const sessions = await getSessions(env);
       const s = sessions.find((x) => x.id === sessionId);
-      const detail = s ? { session_id: sessionId, session_start: s.start, session_spots_at_click: s.spots, level: s.level, area: s.area, lead } : { session_id: sessionId, lead };
+      const detail = s
+        ? { session_id: sessionId, session_start: s.start, session_spots_at_click: s.spots, level: s.level, area: s.area, lead }
+        : { session_id: sessionId, lead };
       await logEvent(env, chatId, "click", detail);
+      // Schedule a follow-up survey 30 min after session start (fallback: 30 min from now).
+      const due = (s ? s.start : Date.now()) + 30 * 60 * 1000;
+      await queueFollowup(env, { chat_id: chatId, session_id: sessionId, due_ts: due, click_ts: Date.now(), session_start: s ? s.start : null, session_title: s ? s.title : "", level: s ? s.level : null, area: s ? s.area : "" });
       return Response.redirect(SRF_URL, 302);
     }
 
@@ -1218,26 +1299,44 @@ export default {
       const known = await getKnownUsers(env);
       const wl = await getWhitelist(env);
       const all = [...new Set([...known, ...wl])];
+      const sessions = await getSessions(env);
+      const sessionById = Object.fromEntries(sessions.map((s) => [s.id, s]));
+
       const out = {};
       for (const id of all) {
         const prefs = await getUserPrefs(env, id);
         const events = await getEvents(env, id);
-        if (events.length || prefs) {
-          out[id] = {
-            prefs: prefs && {
-              full_name: prefs.full_name,
-              username: prefs.username,
-              levels: getLevels(prefs),
-              direction: prefs.direction,
-              spots_threshold: prefs.spots_threshold,
-              address: prefs.address,
-              cmd_count: prefs.cmd_count || 0,
-              last_cmd_at: prefs.last_cmd_at,
-            },
-            stats: computeStats(events),
-            events,
-          };
+        if (!events.length && !prefs) continue;
+        const stats = computeStats(events);
+        // Cross-reference clicks with current sessions: if spots dropped
+        // since the click, mark as "probably_registered" (passive heuristic).
+        if (stats && stats.alert_clicks) {
+          stats.session_probable_registration = {};
+          for (const [sid, spotsAtClick] of Object.entries(stats.clicks_by_session)) {
+            const cur = sessionById[sid];
+            if (!cur || spotsAtClick == null) continue;
+            stats.session_probable_registration[sid] = {
+              spots_at_click: spotsAtClick,
+              spots_now: cur.spots,
+              dropped: spotsAtClick - cur.spots,
+              session_start: cur.start,
+            };
+          }
         }
+        out[id] = {
+          prefs: prefs && {
+            full_name: prefs.full_name,
+            username: prefs.username,
+            levels: getLevels(prefs),
+            direction: prefs.direction,
+            spots_threshold: prefs.spots_threshold,
+            address: prefs.address,
+            cmd_count: prefs.cmd_count || 0,
+            last_cmd_at: prefs.last_cmd_at,
+          },
+          stats,
+          events,
+        };
       }
       return new Response(JSON.stringify(out, null, 2), {
         headers: {
