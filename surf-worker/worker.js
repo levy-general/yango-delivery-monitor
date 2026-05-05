@@ -740,14 +740,20 @@ async function showSessionsForDate(env, chatId, dayKey) {
 
 // One inline-keyboard button per session — opens the tracked registration link.
 function sessionsKeyboard(chatId, sessions, workerOrigin) {
-  // Telegram clamps inline-button text; keep it short. Title appears in the
-  // message text above; the button just identifies the time + capacity.
+  // Title is the most useful identifier (multiple wave types per L). Side and
+  // level are implied by the title and shown in the message above.
   const rows = sessions.slice(0, 25).map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
-    const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
-    const label = `📝 ${time} · L${s.level} ${side} · ${s.spots} מקומות`;
+    // Drop a redundant "L<level> - " prefix the SRF site sometimes uses,
+    // since we always render the same level filter.
+    const cleanTitle = (s.title || "").replace(/^L\d+\s*[-–—]\s*/, "").trim();
+    const TITLE_MAX = 28;
+    const title = cleanTitle.length > TITLE_MAX
+      ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
+      : cleanTitle;
+    const label = `📝 ${time} · ${title} · ${s.spots} פנוי`;
     return [{ text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
   });
   return { inline_keyboard: rows };
