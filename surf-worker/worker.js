@@ -45,6 +45,10 @@ async function setUserPrefs(env, chatId, prefs) {
 
 async function deleteUser(env, chatId) {
   await env.KV.delete(userKey(chatId));
+  await unsubscribeUser(env, chatId);
+}
+
+async function unsubscribeUser(env, chatId) {
   const users = await getUsers(env);
   await env.KV.put(
     "users",
@@ -273,41 +277,61 @@ function thresholdKeyboard(levels) {
 }
 
 async function handleAddressInput(env, chatId, prefs, text, location) {
-  let addr = null, lat = null, lon = null;
+  // Live location is unambiguous — accept directly.
   if (location) {
-    lat = location.latitude;
-    lon = location.longitude;
-    addr = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
-  } else if (text) {
-    const g = await geocode(text);
-    if (!g) {
-      await tg(env, "sendMessage", {
-        chat_id: chatId,
-        text: "לא הצלחתי למצוא את הכתובת הזו. תנסה שוב או שלח מיקום (📎 → Location).",
-      });
-      return;
-    }
-    lat = g.lat;
-    lon = g.lon;
-    addr = text;
+    prefs.lat = location.latitude;
+    prefs.lon = location.longitude;
+    prefs.address = `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`;
+    prefs.pending = null;
+    await setUserPrefs(env, chatId, prefs);
+    await proceedAfterAddress(env, chatId);
+    return;
   }
 
-  prefs.lat = lat;
-  prefs.lon = lon;
-  prefs.address = addr;
-  prefs.pending = null;
+  // Text address — geocode then ask the user to confirm what we resolved.
+  const g = await geocode(text);
+  if (!g) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "לא הצלחתי למצוא את הכתובת הזו.\n" +
+        "תנסה שוב עם רחוב + מספר + עיר (למשל \"דיזנגוף 50 תל אביב\"),\n" +
+        "או שלח מיקום (📎 → Location).",
+    });
+    return;
+  }
+
+  prefs.pending_lat = g.lat;
+  prefs.pending_lon = g.lon;
+  prefs.pending_address = g.label;
+  prefs.pending_address_input = text;
+  prefs.pending = "address_confirm";
   await setUserPrefs(env, chatId, prefs);
 
-  // Move to wave selection. Use removeKeyboard to clear the location button.
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `✓ הכתובת נשמרה.\n\n<b>שלב 3/5:</b> בחר רמת גל:`,
+    text:
+      `מצאתי:\n📍 <b>${g.label}</b>\n\nזו הכתובת הנכונה?`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ כן, נכון", callback_data: "addrok" },
+        { text: "❌ לא, נסה שוב", callback_data: "addrno" },
+      ]],
+    },
+  });
+}
+
+async function proceedAfterAddress(env, chatId) {
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `✓ הכתובת נשמרה.\n\n<b>שלב 3/5:</b> בחר רמות גל (ניתן לבחור כמה):`,
     parse_mode: "HTML",
     reply_markup: { remove_keyboard: true },
   });
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: "בחר רמת גל:",
+    text: "בחר רמות גל:",
     reply_markup: waveKeyboard(),
   });
 }
@@ -398,23 +422,32 @@ async function cmdStart(env, chatId, from) {
 }
 
 async function cmdReset(env, chatId) {
+  // /reset clears only the surf preferences (levels, direction, threshold);
+  // personal data (name, address, lat/lon) stays untouched.
   const prefs = (await getUserPrefs(env, chatId)) || {};
-  // Keep address if already set; just re-pick wave + direction.
+  delete prefs.levels;
+  delete prefs.level;
+  delete prefs.direction;
+  delete prefs.spots_threshold;
   prefs.pending = null;
   await setUserPrefs(env, chatId, prefs);
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: "🔄 <b>איפוס הגדרות</b>\nבחר רמת גל:",
+    text: "🔄 <b>איפוס העדפות</b>\nבחר רמות גל (ניתן לבחור כמה):",
     parse_mode: "HTML",
     reply_markup: waveKeyboard(),
   });
 }
 
 async function cmdStop(env, chatId) {
-  await deleteUser(env, chatId);
+  // Only unsubscribe from alerts; keep the user's prefs so /start later
+  // restores them without re-onboarding.
+  await unsubscribeUser(env, chatId);
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: "🚪 הוסרת מרשימת ההתראות. שלח /start כדי לחזור.",
+    text:
+      "🚪 הופסקו ההתראות.\n" +
+      "ההגדרות שלך נשמרו — שלח /start כדי לחדש בלי להזין הכל מחדש.",
   });
 }
 
@@ -610,6 +643,44 @@ async function handleUpdate(env, update) {
       return;
     }
 
+    if (data === "addrok" || data === "addrno") {
+      const prefs = (await getUserPrefs(env, chatId)) || {};
+      if (data === "addrok") {
+        prefs.lat = prefs.pending_lat;
+        prefs.lon = prefs.pending_lon;
+        // Show what the user typed; fall back to geocoded label.
+        prefs.address = prefs.pending_address_input || prefs.pending_address;
+        delete prefs.pending_lat;
+        delete prefs.pending_lon;
+        delete prefs.pending_address;
+        delete prefs.pending_address_input;
+        prefs.pending = null;
+        await setUserPrefs(env, chatId, prefs);
+        await tg(env, "editMessageText", {
+          chat_id: chatId,
+          message_id: msgId,
+          text: `📍 <b>${prefs.address}</b>\n✓ נשמר.`,
+          parse_mode: "HTML",
+        });
+        await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+        await proceedAfterAddress(env, chatId);
+      } else {
+        delete prefs.pending_lat;
+        delete prefs.pending_lon;
+        delete prefs.pending_address;
+        delete prefs.pending_address_input;
+        prefs.pending = "address";
+        await setUserPrefs(env, chatId, prefs);
+        await tg(env, "editMessageText", {
+          chat_id: chatId,
+          message_id: msgId,
+          text: "אין בעיה. שלח שוב את הכתובת — מומלץ להוסיף עיר (\"רחוב מספר עיר\").",
+        });
+        await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+      }
+      return;
+    }
+
     if (data.startsWith("date:")) {
       const dayKey = data.slice(5);
       const result = await showSessionsForDate(env, chatId, dayKey);
@@ -792,12 +863,13 @@ async function handleUpdate(env, update) {
     await handleNameInput(env, chatId, prefs, text);
     return;
   }
-  if (prefs.pending === "address") {
+  if (prefs.pending === "address" || prefs.pending === "address_confirm") {
     if (msg.location) {
       await handleAddressInput(env, chatId, prefs, null, msg.location);
       return;
     }
     if (text && !text.startsWith("/")) {
+      // Treat any text input during confirm-stage as a fresh attempt.
       await handleAddressInput(env, chatId, prefs, text, null);
       return;
     }
