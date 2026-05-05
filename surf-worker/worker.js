@@ -629,7 +629,7 @@ async function cmdStart(env, chatId, from) {
         `<b>כתובת:</b> ${prefs.address}\n` +
         `<b>העדפות:</b> ${levelsLabel(lvls)} ${SIDE_HE[prefs.direction]}\n` +
         `<b>סף התראה:</b> מעל ${prefs.spots_threshold} מקומות פנויים\n\n` +
-        `<i>/reset לשינוי הגדרות · /help לכל הפקודות</i>`,
+        `<i>/reset לשינוי הגדרות</i>`,
       parse_mode: "HTML",
       reply_markup: { remove_keyboard: true },
     });
@@ -703,20 +703,6 @@ async function cmdStop(env, chatId) {
   });
 }
 
-async function cmdHelp(env, chatId) {
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text:
-      "🏄 <b>Surf Park Alerts</b>\n\n" +
-      "/today — סשנים שלך היום\n" +
-      "/all — כל הסשנים היום\n" +
-      "/date — סשנים שלך לתאריך נבחר (שבוע קדימה)\n" +
-      "/reset — שינוי רמת גל וכיוון\n" +
-      "/stop — הפסקת התראות\n" +
-      "/help — תפריט זה",
-    parse_mode: "HTML",
-  });
-}
 
 async function cmdDate(env, chatId) {
   await tg(env, "sendMessage", {
@@ -747,10 +733,22 @@ async function showSessionsForDate(env, chatId, dayKey) {
   );
   await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length });
   const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
-  const body = matching.length
-    ? matching.map((s) => fmtSession(s)).join("\n")
-    : "אין סשנים מתאימים בתאריך הזה.";
-  return { header, body };
+  if (!matching.length) return { header, body: "אין סשנים מתאימים בתאריך הזה.", sessions: [] };
+  const body = "לחיצה על סשן תעביר אותך להרשמה.";
+  return { header, body, sessions: matching };
+}
+
+// One inline-keyboard button per session — opens the tracked registration link.
+function sessionsKeyboard(chatId, sessions, workerOrigin) {
+  const rows = sessions.slice(0, 25).map((s) => {
+    const time = new Intl.DateTimeFormat("he-IL", {
+      timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
+    }).format(new Date(s.start));
+    const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
+    const label = `📝 ${time} L${s.level} ${side} (${s.spots} מקומות) — ${s.title}`;
+    return [{ text: label.slice(0, 60), url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
+  });
+  return { inline_keyboard: rows };
 }
 
 // Time-only row (date is shown in the header).
@@ -1010,6 +1008,7 @@ async function handleUpdate(env, update) {
       const dayKey = data.slice(5);
       const result = await showSessionsForDate(env, chatId, dayKey);
       if (result) {
+        const origin = new URL(cb.message.chat ? "https://surf-bot.shayko22.workers.dev" : "https://surf-bot.shayko22.workers.dev").origin;
         await tg(env, "editMessageText", {
           chat_id: chatId,
           message_id: msgId,
@@ -1017,6 +1016,13 @@ async function handleUpdate(env, update) {
           parse_mode: "HTML",
           reply_markup: dateKeyboard(),
         });
+        if (result.sessions && result.sessions.length) {
+          await tg(env, "sendMessage", {
+            chat_id: chatId,
+            text: "👇 בחר סשן להרשמה",
+            reply_markup: sessionsKeyboard(chatId, result.sessions, origin),
+          });
+        }
       }
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
       return;
@@ -1083,8 +1089,7 @@ async function handleUpdate(env, update) {
           `✅ <b>סיימנו!</b>\n\n` +
           `${describePrefs(prefs)}\n` +
           `סף התראה: <b>מעל ${threshold} מקומות פנויים</b>\n\n` +
-          `אקבל התראות 1:45 ו-1:15 לפני סשנים מתאימים.\n` +
-          `שלח /help לכל הפקודות.`,
+          `אקבל התראות 1:45 ו-1:15 לפני סשנים מתאימים.`,
         parse_mode: "HTML",
       });
       await tg(env, "answerCallbackQuery", {
@@ -1166,9 +1171,22 @@ async function handleUpdate(env, update) {
       });
       return;
     }
-    if (parts[0] === "/revoke" && parts[1]) {
-      const target = parseInt(parts[1], 10);
+    if (parts[0] === "/revoke") {
+      const target = parts[1] ? parseInt(parts[1], 10) : NaN;
+      if (!Number.isFinite(target)) {
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text:
+            "שימוש: <code>/revoke &lt;chat_id&gt;</code>\n" +
+            "לדוגמה: <code>/revoke 481683634</code>\n" +
+            "אפשר גם להשתמש בכפתור 🗑 בתוך /list.",
+          parse_mode: "HTML",
+        });
+        return;
+      }
       await revokeUser(env, target);
+      // Also drop from known_users so the user disappears from /list completely.
+      await env.KV.put("known_users", JSON.stringify((await getKnownUsers(env)).filter((x) => x !== target)));
       await tg(env, "sendMessage", {
         chat_id: chatId,
         text: `🚪 גישה הוסרה למשתמש ${target}.`,
@@ -1226,7 +1244,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/help"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -1241,7 +1259,6 @@ async function handleUpdate(env, update) {
   else if (cmd === "/all") await cmdAll(env, chatId);
   else if (cmd === "/date") await cmdDate(env, chatId);
   else if (cmd === "/stop") await cmdStop(env, chatId);
-  else if (cmd === "/help") await cmdHelp(env, chatId);
 }
 
 // ---------- Worker entry ----------
