@@ -801,7 +801,7 @@ async function cmdToday(env, chatId) {
   await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length });
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
   const body = matching.length
-    ? matching.map((s) => fmtSession(s)).join("\n")
+    ? "לחיצה על סשן תעביר אותך להרשמה."
     : "אין סשנים מתאימים שנותרו היום.";
   await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -809,6 +809,13 @@ async function cmdToday(env, chatId) {
     parse_mode: "HTML",
     disable_web_page_preview: true,
   });
+  if (matching.length) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "👇 בחר סשן להרשמה",
+      reply_markup: sessionsKeyboard(chatId, matching, "https://surf-bot.shayko22.workers.dev"),
+    });
+  }
 }
 
 async function cmdAll(env, chatId) {
