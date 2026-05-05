@@ -300,11 +300,11 @@ async function cmdStart(env, chatId, from) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text:
-        `👋 ברוך הבא חזרה <b>${prefs.full_name}</b>!\n\n` +
-        `הגדרות נוכחיות:\n` +
-        `• רמה: <b>L${prefs.level} ${SIDE_HE[prefs.direction]}</b>\n` +
-        `• כתובת: ${prefs.address}\n\n` +
-        `שלח /reset לשנות הגדרות, /help לכל הפקודות.`,
+        `👋 <b>ברוך השב!</b>\n\n` +
+        `<b>שם:</b> ${prefs.full_name}\n` +
+        `<b>כתובת:</b> ${prefs.address}\n` +
+        `<b>העדפות:</b> L${prefs.level} ${SIDE_HE[prefs.direction]}\n\n` +
+        `<i>/reset לשינוי הגדרות · /help לכל הפקודות</i>`,
       parse_mode: "HTML",
       reply_markup: { remove_keyboard: true },
     });
