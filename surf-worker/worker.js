@@ -1326,16 +1326,21 @@ async function handleUpdate(env, update) {
           reply_markup: await dateKeyboard(env),
         });
         const prefs = await getUserPrefs(env, chatId);
+        // Header that disambiguates this message when the user clicks several dates.
+        const wantedDay = `${dayKey.slice(6, 8)}/${dayKey.slice(4, 6)}/${dayKey.slice(0, 4)}`;
+        const dateLine = `📅 <b>${wantedDay}</b>`;
         if (result.sessions && result.sessions.length) {
           await tg(env, "sendMessage", {
             chat_id: chatId,
-            text: "👇 בחר סשן להרשמה",
+            text: `${dateLine}\n👇 בחר סשן להרשמה`,
+            parse_mode: "HTML",
             reply_markup: sessionsKeyboard(chatId, result.sessions, origin, prefs),
           });
         } else {
           await tg(env, "sendMessage", {
             chat_id: chatId,
-            text: "אם תרצה, תקבל התראה ברגע שיתפנה מקום ביום הזה:",
+            text: `${dateLine}\nאם תרצה, תקבל התראה ברגע שיתפנה מקום ביום הזה:`,
+            parse_mode: "HTML",
             reply_markup: huntKeyboardForPrefs(prefs, dayKey),
           });
         }
