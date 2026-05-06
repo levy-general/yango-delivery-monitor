@@ -675,10 +675,10 @@ async function askAddress(env, chatId) {
 async function dateKeyboard(env) {
   const sessions = (await getSessions(env)) || [];
   const nowMs = Date.now();
-  // Determine which day-keys actually have at least one upcoming session.
+  // Day keys that have at least one upcoming session with available spots.
   const dayKeysWithFuture = new Set();
   for (const s of sessions) {
-    if (s.start <= nowMs) continue;
+    if (s.start <= nowMs || s.spots <= 0) continue;
     const k = new Intl.DateTimeFormat("en-CA", {
       timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
     }).format(new Date(s.start)).replace(/-/g, "");
@@ -980,13 +980,18 @@ async function showSessionsForDate(env, chatId, dayKey) {
       s.start > nowMs &&
       sessionDayKey(s) === wantedDay
   );
-  const availableDate = matching.filter((s) => s.spots > 0).length;
-  await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length, available: availableDate });
-  await logSearchD1(env, chatId, "/date", getLevels(prefs), prefs.direction, dayKey, matching.length, availableDate);
+  const bookable = matching.filter((s) => s.spots > 0);
+  await logEvent(env, chatId, "result", { cmd: "/date", date: wantedDay, matched: matching.length, available: bookable.length });
+  await logSearchD1(env, chatId, "/date", getLevels(prefs), prefs.direction, dayKey, matching.length, bookable.length);
   const header = `📋 <b>${wantedDay} (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
-  if (!matching.length) return { header, body: "אין סשנים מתאימים בתאריך הזה.", sessions: [] };
-  const body = matching.map((s) => fmtSession(s)).join("\n");
-  return { header, body, sessions: matching };
+  if (!bookable.length) {
+    const body = matching.length
+      ? "כל הסשנים המתאימים מלאים."
+      : "אין סשנים מתאימים בתאריך הזה.";
+    return { header, body, sessions: [] };
+  }
+  const body = bookable.map((s) => fmtSession(s)).join("\n");
+  return { header, body, sessions: bookable };
 }
 
 // One inline-keyboard button per session — opens the tracked registration link.
@@ -1059,24 +1064,24 @@ async function cmdToday(env, chatId) {
       s.start > nowMs &&
       sessionDayKey(s) === today
   );
-  const availableToday = matching.filter((s) => s.spots > 0).length;
-  await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length, available: availableToday });
-  await logSearchD1(env, chatId, "/today", getLevels(prefs), prefs.direction, null, matching.length, availableToday);
+  const bookable = matching.filter((s) => s.spots > 0);
+  await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length, available: bookable.length });
+  await logSearchD1(env, chatId, "/today", getLevels(prefs), prefs.direction, null, matching.length, bookable.length);
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
-  const body = matching.length
-    ? matching.map((s) => fmtSession(s)).join("\n")
-    : "אין סשנים מתאימים שנותרו היום.";
+  const body = bookable.length
+    ? bookable.map((s) => fmtSession(s)).join("\n")
+    : "אין סשנים זמינים להזמנה היום.";
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text: header + body,
     parse_mode: "HTML",
     disable_web_page_preview: true,
   });
-  if (matching.length) {
+  if (bookable.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "👇 בחר סשן להרשמה",
-      reply_markup: sessionsKeyboard(chatId, matching, "https://surf-bot.shayko22.workers.dev", prefs),
+      reply_markup: sessionsKeyboard(chatId, bookable, "https://surf-bot.shayko22.workers.dev", prefs),
     });
   } else {
     await tg(env, "sendMessage", {
@@ -1094,18 +1099,18 @@ async function cmdAll(env, chatId) {
   const todays = sessions.filter(
     (s) => s.start > nowMs && sessionDayKey(s) === today
   );
-  const availableAll = todays.filter((s) => s.spots > 0).length;
-  await logEvent(env, chatId, "result", { cmd: "/all", matched: todays.length, available: availableAll });
-  await logSearchD1(env, chatId, "/all", null, null, null, todays.length, availableAll);
-  if (!todays.length) {
+  const bookable = todays.filter((s) => s.spots > 0);
+  await logEvent(env, chatId, "result", { cmd: "/all", matched: todays.length, available: bookable.length });
+  await logSearchD1(env, chatId, "/all", null, null, null, todays.length, bookable.length);
+  if (!bookable.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "אין סשנים שנותרו היום.",
+      text: todays.length ? "כל הסשנים היום מלאים." : "אין סשנים שנותרו היום.",
     });
     return;
   }
-  const lines = ["📋 <b>כל הסשנים שנותרו היום</b>"];
-  for (const s of todays) {
+  const lines = ["📋 <b>סשנים זמינים להזמנה היום</b>"];
+  for (const s of bookable) {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem",
       hour: "2-digit",
