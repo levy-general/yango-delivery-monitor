@@ -870,6 +870,7 @@ async function cmdStart(env, chatId, from) {
     prefs.spots_threshold;
   if (complete) {
     await addUser(env, chatId);
+    await setUserMenu(env, chatId, false);
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text:
@@ -1018,15 +1019,66 @@ async function cmdAlerts(env, chatId) {
   });
 }
 
+// Per-chat command menus — surface /resume when the user paused, /stop when active.
+const CMDS_ACTIVE = [
+  { command: "today", description: "סשנים שלי היום" },
+  { command: "date", description: "בחירת סשן להרשמה" },
+  { command: "alerts", description: "ההתראות שלי על סשנים מלאים" },
+  { command: "feedback", description: "שליחת פידבק / באג / רעיון" },
+  { command: "reset", description: "שינוי רמת גל וכיוון" },
+  { command: "stop", description: "השהה התראות" },
+];
+const CMDS_PAUSED = [
+  { command: "resume", description: "חידוש התראות" },
+  { command: "today", description: "סשנים שלי היום" },
+  { command: "date", description: "בחירת סשן להרשמה" },
+  { command: "alerts", description: "ההתראות שלי על סשנים מלאים" },
+  { command: "feedback", description: "שליחת פידבק / באג / רעיון" },
+  { command: "reset", description: "שינוי רמת גל וכיוון" },
+];
+
+async function setUserMenu(env, chatId, paused) {
+  const list = paused ? CMDS_PAUSED : CMDS_ACTIVE;
+  // Admin already has a richer scoped menu set globally — don't overwrite.
+  if (chatId === ADMIN_CHAT_ID) return;
+  await tg(env, "setMyCommands", {
+    commands: list,
+    scope: { type: "chat", chat_id: chatId },
+  });
+}
+
 async function cmdStop(env, chatId) {
-  // Only unsubscribe from alerts; keep the user's prefs so /start later
-  // restores them without re-onboarding.
   await unsubscribeUser(env, chatId);
+  await setUserMenu(env, chatId, true);
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
-      "🚪 הופסקו ההתראות.\n" +
-      "ההגדרות שלך נשמרו — שלח /start כדי לחדש בלי להזין הכל מחדש.",
+      "⏸ ההתראות הושהו.\n" +
+      "ההגדרות שלך נשמרו — שלח /resume לחדש.",
+  });
+}
+
+async function cmdResume(env, chatId) {
+  const prefs = (await getUserPrefs(env, chatId)) || {};
+  const lvls = getLevels(prefs);
+  if (!prefs.full_name || !prefs.address || !lvls.length || !prefs.direction || !prefs.spots_threshold) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "צריך להשלים הרשמה קודם — שלח /start.",
+    });
+    return;
+  }
+  await addUser(env, chatId);
+  await setUserMenu(env, chatId, false);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text:
+      `▶️ ההתראות חודשו.\n\n` +
+      `<b>שם:</b> ${prefs.full_name}\n` +
+      `<b>כתובת:</b> ${prefs.address}\n` +
+      `<b>העדפות:</b> ${levelsLabel(lvls)} ${SIDE_HE[prefs.direction]}\n` +
+      `<b>סף:</b> מעל ${prefs.spots_threshold} מקומות`,
+    parse_mode: "HTML",
   });
 }
 
@@ -1481,6 +1533,7 @@ async function handleUpdate(env, update) {
       prefs.pending = null;
       await setUserPrefs(env, chatId, prefs);
       await addUser(env, chatId);
+      await setUserMenu(env, chatId, false);
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: msgId,
@@ -1665,7 +1718,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/alerts", "/feedback"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/alerts", "/feedback"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -1677,9 +1730,9 @@ async function handleUpdate(env, update) {
   if (cmd === "/start") await cmdStart(env, chatId, msg.from);
   else if (cmd === "/reset") await cmdReset(env, chatId);
   else if (cmd === "/today") await cmdToday(env, chatId);
-  else if (cmd === "/all") await cmdAll(env, chatId);
   else if (cmd === "/date") await cmdDate(env, chatId);
   else if (cmd === "/stop") await cmdStop(env, chatId);
+  else if (cmd === "/resume") await cmdResume(env, chatId);
   else if (cmd === "/alerts") await cmdAlerts(env, chatId);
   else if (cmd === "/feedback") await cmdFeedback(env, chatId);
 }
