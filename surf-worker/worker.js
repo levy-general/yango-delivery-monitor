@@ -19,6 +19,19 @@ const WAVE_LEVELS = [1, 2, 3, 4, 5, 6];
 const ADMIN_CHAT_ID = 328859712;  // Shay — sole admin; can approve new users.
 const SRF_URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show-adults=false&zone=reef-left";
 
+// Title rewrites — for sessions with overlong/uninformative names from SRF.
+// Match is exact (case-insensitive) on the original title from the site.
+const TITLE_OVERRIDES = {
+  "2b or not to be - barrel fest": "B2B (B2+B3)",
+};
+
+function displayTitle(raw) {
+  if (!raw) return "";
+  const key = raw.trim().toLowerCase();
+  if (TITLE_OVERRIDES[key]) return TITLE_OVERRIDES[key];
+  return raw.replace(/^L\d+\s*[-–—]\s*/, "").trim();
+}
+
 // ---------- Telegram ----------
 async function tg(env, method, payload) {
   const res = await fetch(
@@ -1003,7 +1016,7 @@ function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
-    const cleanTitle = (s.title || "").replace(/^L\d+\s*[-–—]\s*/, "").trim();
+    const cleanTitle = displayTitle(s.title);
     // Budget the remaining width on the title.
     const lvlPart = `L${s.level}` + (showSide ? ` ${side}` : "");
     const fixed = `📝 ${time} · ${lvlPart} ·  · ${s.spots} פנוי`.length;  // rough
@@ -1025,7 +1038,7 @@ function fmtSession(s) {
     minute: "2-digit",
   }).format(new Date(s.start));
   const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
-  return `• ${time} L${s.level} ${side} — ${s.title} — נותרו ${s.spots} מקומות`;
+  return `• ${time} L${s.level} ${side} — ${displayTitle(s.title)} — נותרו ${s.spots} מקומות`;
 }
 
 function todayKeyIL() {
