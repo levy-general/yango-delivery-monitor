@@ -211,8 +211,20 @@ def save_state(state: dict) -> None:
 
 
 # ---------- Filters ----------
+def get_user_levels(prefs: dict) -> list[int]:
+    """Multi-select migration: prefer prefs.levels (array); fall back to single
+    prefs.level for older records."""
+    lvls = prefs.get("levels")
+    if isinstance(lvls, list) and lvls:
+        return lvls
+    if prefs.get("level"):
+        return [prefs["level"]]
+    return []
+
+
 def matches_prefs(s: dict, prefs: dict) -> bool:
-    if s["level"] != prefs.get("level"):
+    levels = get_user_levels(prefs)
+    if not levels or s["level"] not in levels:
         return False
     direction = prefs.get("direction", "left")
     area = s["area"].lower()
@@ -227,7 +239,7 @@ def matches_prefs(s: dict, prefs: dict) -> bool:
 def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
     chat_id = user["chat_id"]
     prefs = user.get("prefs") or {}
-    if not prefs.get("level"):
+    if not get_user_levels(prefs):
         return  # not yet onboarded
 
     user_state = state.setdefault(str(chat_id), {})
@@ -284,7 +296,8 @@ def process_user_summary(user: dict, sessions: list[dict], state: dict, force: b
     """Send tomorrow's L? sessions summary to one user at ~20:00 IL."""
     chat_id = user["chat_id"]
     prefs = user.get("prefs") or {}
-    if not prefs.get("level"):
+    levels = get_user_levels(prefs)
+    if not levels:
         return
 
     now = datetime.now(TZ)
@@ -310,7 +323,8 @@ def process_user_summary(user: dict, sessions: list[dict], state: dict, force: b
 
     side_he = {"right": "ימין", "left": "שמאל", "both": "ימין+שמאל"}[prefs.get("direction", "left")]
     weekday_he = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"][tomorrow.weekday()]
-    header = f"📅 <b>Surf Park — סשני L{prefs['level']} {side_he} ליום {weekday_he} ({tomorrow.strftime('%d/%m')})</b>\n"
+    levels_label = "+".join(f"L{l}" for l in levels)
+    header = f"📅 <b>Surf Park — סשני {levels_label} {side_he} ליום {weekday_he} ({tomorrow.strftime('%d/%m')})</b>\n"
     body = (
         "\n".join(
             f"• {s['start'].strftime('%H:%M')} — {s['title']} — נותרו {s['spots']} מקומות"
