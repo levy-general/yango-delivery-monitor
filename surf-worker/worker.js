@@ -161,6 +161,31 @@ async function cancelAlert(env, chatId, alertId) {
   );
 }
 
+async function saveFeedback(env, chatId, content) {
+  if (!env.DB) return null;
+  const r = await d1Run(env,
+    "INSERT INTO feedback (telegram_id, content) VALUES (?, ?)",
+    [chatId, content]);
+  return r;
+}
+
+async function listRecentFeedback(env, limit = 20) {
+  if (!env.DB) return [];
+  const r = await d1Run(env,
+    `SELECT f.id, f.telegram_id, f.content, f.status, f.created_at,
+            u.full_name, u.username
+     FROM feedback f
+     LEFT JOIN users u ON u.telegram_id = f.telegram_id
+     ORDER BY f.created_at DESC LIMIT ?`,
+    [limit]);
+  return r.results || [];
+}
+
+async function markFeedbackAck(env, id) {
+  if (!env.DB) return;
+  await d1Run(env, "UPDATE feedback SET status='acknowledged', acknowledged_at=datetime('now') WHERE id=?", [id]);
+}
+
 async function fireDueHuntAlerts(env) {
   if (!env.DB) return 0;
   const sessions = await getSessions(env);
@@ -926,6 +951,46 @@ function huntKeyboardForPrefs(prefs, dayKey = null) {
   ]] };
 }
 
+async function cmdFeedback(env, chatId) {
+  const prefs = (await getUserPrefs(env, chatId)) || {};
+  prefs.pending = "feedback";
+  await setUserPrefs(env, chatId, prefs);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "💬 <b>שליחת פידבק</b>\n" +
+      "תכתוב כאן את ההודעה שלך — באג, רעיון, בקשה או מה שתרצה.\n" +
+      "(לביטול: /start)",
+    parse_mode: "HTML",
+  });
+}
+
+async function handleFeedbackInput(env, chatId, prefs, text) {
+  await saveFeedback(env, chatId, text);
+  prefs.pending = null;
+  await setUserPrefs(env, chatId, prefs);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "✅ תודה! הפידבק נשלח. נחזור אליך אם יהיה צורך.",
+  });
+  // Notify admin with a quick reply button.
+  const tgName = [prefs.tg_first_name, prefs.tg_last_name].filter(Boolean).join(" ");
+  const name = prefs.full_name || tgName || "(לא ידוע)";
+  const uname = prefs.username ? `@${prefs.username}` : "(אין שם משתמש)";
+  await tg(env, "sendMessage", {
+    chat_id: ADMIN_CHAT_ID,
+    text:
+      `💬 <b>פידבק חדש</b>\n` +
+      `מאת: ${name} — ${uname}\n` +
+      `<code>${chatId}</code>\n\n` +
+      `${text}`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[
+      { text: "💬 פנה למשתמש", url: prefs.username ? `https://t.me/${prefs.username}` : `tg://user?id=${chatId}` },
+    ]] },
+  });
+}
+
 async function cmdAlerts(env, chatId) {
   const rows = await listUserAlerts(env, chatId);
   if (!rows.length) {
@@ -1464,6 +1529,30 @@ async function handleUpdate(env, update) {
       await renderUserList(env, chatId);
       return;
     }
+    if (parts[0] === "/feedbacks") {
+      const rows = await listRecentFeedback(env, 20);
+      if (!rows.length) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "אין פידבקים." });
+        return;
+      }
+      const lines = [`💬 <b>פידבקים אחרונים (${rows.length})</b>`, ""];
+      for (const r of rows) {
+        const who = r.full_name || (r.username ? `@${r.username}` : `${r.telegram_id}`);
+        const flag = r.status === "acknowledged" ? "✓" : "🆕";
+        lines.push(`${flag} #${r.id} · <b>${who}</b> · <code>${r.created_at}</code>\n${r.content}\n`);
+      }
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: lines.join("\n").slice(0, 4090),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    if (parts[0] === "/fbdone" && parts[1]) {
+      await markFeedbackAck(env, parseInt(parts[1], 10));
+      await tg(env, "sendMessage", { chat_id: chatId, text: `✓ סומן כטופל.` });
+      return;
+    }
     if (parts[0] === "/events" && parts[1]) {
       const target = parseInt(parts[1], 10);
       const events = await getEvents(env, target);
@@ -1561,6 +1650,10 @@ async function handleUpdate(env, update) {
 
   // Mid-onboarding handlers — accept free-text input depending on stage.
   const prefs = (await getUserPrefs(env, chatId)) || {};
+  if (prefs.pending === "feedback" && text && !text.startsWith("/")) {
+    await handleFeedbackInput(env, chatId, prefs, text);
+    return;
+  }
   if (prefs.pending === "name" && text && !text.startsWith("/")) {
     await handleNameInput(env, chatId, prefs, text);
     return;
@@ -1578,7 +1671,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/alerts"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/all", "/date", "/stop", "/alerts", "/feedback"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -1594,6 +1687,7 @@ async function handleUpdate(env, update) {
   else if (cmd === "/date") await cmdDate(env, chatId);
   else if (cmd === "/stop") await cmdStop(env, chatId);
   else if (cmd === "/alerts") await cmdAlerts(env, chatId);
+  else if (cmd === "/feedback") await cmdFeedback(env, chatId);
 }
 
 // ---------- Worker entry ----------
