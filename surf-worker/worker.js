@@ -574,10 +574,9 @@ async function renderUserList(env, chatId) {
   }
 }
 
-async function notifyAdminAccessRequest(env, msg) {
+async function notifyAdminNewUser(env, msg) {
   const from = msg.from || {};
-  // Persist whatever Telegram identity we already have so /list shows it
-  // before the user finishes onboarding.
+  // Persist Telegram identity so /list shows it from the get-go.
   const prefs = (await getUserPrefs(env, msg.chat.id)) || {};
   if (from.username) prefs.username = from.username;
   if (from.first_name) prefs.tg_first_name = from.first_name;
@@ -590,13 +589,14 @@ async function notifyAdminAccessRequest(env, msg) {
   await tg(env, "sendMessage", {
     chat_id: ADMIN_CHAT_ID,
     text:
-      `🔔 <b>בקשת גישה חדשה</b>\n` +
-      `שם: ${name}\nשם משתמש: ${uname}\nchat_id: <code>${msg.chat.id}</code>`,
+      `👋 <b>משתמש חדש נכנס</b>\n` +
+      `שם: ${name}\nשם משתמש: ${uname}\nchat_id: <code>${msg.chat.id}</code>\n\n` +
+      `אם לא מוכר — אפשר להסיר ב-/list או <code>/revoke ${msg.chat.id}</code>.`,
     parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [[
-        { text: "✅ אישור", callback_data: `approve:${msg.chat.id}` },
-        { text: "❌ דחיה", callback_data: `deny:${msg.chat.id}` },
+        { text: "💬 פנה למשתמש", url: from.username ? `https://t.me/${from.username}` : `tg://user?id=${msg.chat.id}` },
+        { text: "🚪 הסרה", callback_data: `udelete:${msg.chat.id}` },
       ]],
     },
   });
@@ -1631,21 +1631,15 @@ async function handleUpdate(env, update) {
     }
   }
 
+  // Auto-approve every new chat: add to whitelist, notify admin (info only).
   if (!(await isApproved(env, chatId))) {
-    // First contact from un-approved user → notify admin once.
-    const requestKey = `pending:${chatId}`;
-    const already = await env.KV.get(requestKey);
+    await approveUser(env, chatId);
+    const seenKey = `seen:${chatId}`;
+    const already = await env.KV.get(seenKey);
     if (!already) {
-      await env.KV.put(requestKey, "1", { expirationTtl: 86400 });
-      await notifyAdminAccessRequest(env, msg);
+      await env.KV.put(seenKey, "1");
+      await notifyAdminNewUser(env, msg);
     }
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text:
-        "🚫 הבוט בגישה מוגבלת. בקשתך נשלחה לבעלים לאישור.\n" +
-        "תקבל הודעה ברגע שתאושר.",
-    });
-    return;
   }
 
   // Mid-onboarding handlers — accept free-text input depending on stage.
