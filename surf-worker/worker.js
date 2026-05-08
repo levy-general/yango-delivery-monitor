@@ -1044,10 +1044,19 @@ const CMDS_PAUSED = [
   { command: "reset", description: "שינוי רמת גל וכיוון" },
 ];
 
+const ADMIN_TOOLS = [
+  { command: "list", description: "[אדמין] רשימת משתמשים" },
+  { command: "feedbacks", description: "[אדמין] פידבקים אחרונים" },
+  { command: "fbdone", description: "[אדמין] סימון פידבק כטופל" },
+  { command: "events", description: "[אדמין] אירועי משתמש" },
+  { command: "export", description: "[אדמין] סיכום אירועים" },
+  { command: "approve", description: "[אדמין] אישור chat_id" },
+  { command: "revoke", description: "[אדמין] הסרת גישה chat_id" },
+];
+
 async function setUserMenu(env, chatId, paused) {
-  const list = paused ? CMDS_PAUSED : CMDS_ACTIVE;
-  // Admin already has a richer scoped menu set globally — don't overwrite.
-  if (chatId === ADMIN_CHAT_ID) return;
+  const base = paused ? CMDS_PAUSED : CMDS_ACTIVE;
+  const list = chatId === ADMIN_CHAT_ID ? base.concat(ADMIN_TOOLS) : base;
   await tg(env, "setMyCommands", {
     commands: list,
     scope: { type: "chat", chat_id: chatId },
