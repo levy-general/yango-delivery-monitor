@@ -480,11 +480,13 @@ async function revokeUser(env, chatId) {
 }
 
 async function userStatus(env, id) {
+  // Status is admin-controlled only:
+  //   In whitelist → active (🟢)  · Out → frozen (🔴, admin revoked)
+  // Whether the user paused their own alerts is a separate sub-state shown
+  // as a badge — it does NOT change the status colour.
   const wl = await getWhitelist(env);
-  const users = await getUsers(env);
-  if (!wl.includes(id)) return { status: "ממתין לאישור", dot: "🟡" };
-  if (users.includes(id)) return { status: "פעיל", dot: "🟢" };
-  return { status: "מוקפא", dot: "🔴" };
+  if (!wl.includes(id)) return { status: "מוקפא", dot: "🔴" };
+  return { status: "פעיל", dot: "🟢" };
 }
 
 function contactButton(id, p) {
@@ -498,43 +500,29 @@ function contactButton(id, p) {
 function userActionKeyboard(id, status, p) {
   if (id === ADMIN_CHAT_ID) return undefined;  // admin has no actions
   const contact = contactButton(id, p);
-  if (status === "ממתין לאישור") {
-    return { inline_keyboard: [
-      [contact],
-      [
-        { text: "✅ אשר", callback_data: `uapprove:${id}` },
-        { text: "❌ דחה", callback_data: `udeny:${id}` },
-      ],
-    ] };
-  }
   if (status === "פעיל") {
     return { inline_keyboard: [
       [contact],
-      [
-        { text: "🔴 הקפא", callback_data: `ufreeze:${id}` },
-        { text: "🗑 מחק", callback_data: `udelete:${id}` },
-      ],
+      [{ text: "🔴 הקפא חשבון", callback_data: `udelete:${id}` }],
     ] };
   }
   // frozen
   return { inline_keyboard: [
     [contact],
-    [
-      { text: "🟢 הפעל מחדש", callback_data: `uactivate:${id}` },
-      { text: "🗑 מחק", callback_data: `udelete:${id}` },
-    ],
+    [{ text: "🟢 שחזר חשבון", callback_data: `uactivate:${id}` }],
   ] };
 }
 
-function renderUserBlock(id, p, status, dot) {
+function renderUserBlock(id, p, status, dot, subscribed) {
   const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
   const name = (p && p.full_name) || tgName || "(לא הזין שם)";
   const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
   const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
   const lvls = p ? getLevels(p) : [];
+  const alertBadge = status === "פעיל" ? (subscribed ? "🔔" : "🔕 השהה התראות") : "";
   const lines = [];
   lines.push(`${dot} <b>${name}</b>${isAdmin} — ${uname}`);
-  lines.push(`<code>${id}</code> · <i>${status}</i>`);
+  lines.push(`<code>${id}</code> · <i>${status}</i>${alertBadge ? `  ${alertBadge}` : ""}`);
   if (lvls.length && p.direction) {
     lines.push(`העדפות: ${levelsLabel(lvls)} ${SIDE_HE[p.direction] || p.direction}` +
       (p.spots_threshold ? `  · סף: ${p.spots_threshold}+` : ""));
@@ -550,24 +538,29 @@ async function renderUserList(env, chatId) {
   const known = await getKnownUsers(env);
   const all = [...new Set([...known, ...wl])];
 
-  let nG = 0, nY = 0, nR = 0;
+  let nG = 0, nR = 0, nPaused = 0;
   const items = [];
   for (const id of all) {
     const p = await getUserPrefs(env, id);
     const { status, dot } = await userStatus(env, id);
-    if (dot === "🟢") nG++; else if (dot === "🟡") nY++; else nR++;
-    items.push({ id, p, status, dot });
+    const subscribed = users.includes(id);
+    if (dot === "🟢") {
+      nG++;
+      if (!subscribed) nPaused++;
+    } else nR++;
+    items.push({ id, p, status, dot, subscribed });
   }
 
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🟡 ${nY} · 🔴 ${nR}`,
+    text: `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🔴 ${nR}` +
+      (nPaused ? `  ·  🔕 השהה התראות: ${nPaused}` : ""),
     parse_mode: "HTML",
   });
-  for (const { id, p, status, dot } of items) {
+  for (const { id, p, status, dot, subscribed } of items) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: renderUserBlock(id, p, status, dot),
+      text: renderUserBlock(id, p, status, dot, subscribed),
       parse_mode: "HTML",
       reply_markup: userActionKeyboard(id, status, p),
     });
@@ -1329,24 +1322,26 @@ async function handleUpdate(env, update) {
         await unsubscribeUser(env, target);
         toastMsg = "הוקפא";
       } else if (action === "uactivate") {
-        await addUser(env, target);
-        toastMsg = "הופעל";
+        // "שחזר חשבון" — add back to whitelist (admin-controlled).
+        await approveUser(env, target);
+        toastMsg = "החשבון שוחזר";
       } else if (action === "udelete") {
+        // "הקפא חשבון" — remove from whitelist + unsubscribe + drop prefs.
         await deleteUser(env, target);
         await env.KV.put("whitelist", JSON.stringify((await getWhitelist(env)).filter((x) => x !== target)));
-        await env.KV.put("known_users", JSON.stringify((await getKnownUsers(env)).filter((x) => x !== target)));
-        toastMsg = "נמחק";
+        toastMsg = "החשבון הוקפא";
       }
-      // For full removals — drop the card entirely.
-      if (action === "udeny" || action === "udelete") {
+      // For deny → drop card; udelete keeps card with re-activate button.
+      if (action === "udeny") {
         await tg(env, "deleteMessage", { chat_id: chatId, message_id: msgId });
       } else {
         const p = await getUserPrefs(env, target);
         const { status, dot } = await userStatus(env, target);
+        const subscribed = (await getUsers(env)).includes(target);
         await tg(env, "editMessageText", {
           chat_id: chatId,
           message_id: msgId,
-          text: renderUserBlock(target, p, status, dot),
+          text: renderUserBlock(target, p, status, dot, subscribed),
           parse_mode: "HTML",
           reply_markup: userActionKeyboard(target, status, p),
         });
