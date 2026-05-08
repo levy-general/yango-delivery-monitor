@@ -189,25 +189,26 @@ async function logAlertSent(env, chatId, kind, sessionId = null) {
 }
 
 async function getAlertCounts(env, chatId) {
-  if (!env.DB) return { today: 0, total: 0 };
-  // IL day boundaries: today's midnight in Asia/Jerusalem.
-  const ilNow = new Date();
+  if (!env.DB) return { today: 0, total: 0, last7: 0, lastAt: null };
   const ilDateStr = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
-  }).format(ilNow);  // YYYY-MM-DD
-  // SQLite stores TEXT timestamps in UTC; offset 03:00 = winter, 02:00 = summer.
-  // Use the IL day as a substring match on the local-time string we passed.
-  // Simpler: compute count of rows with sent_at >= today's midnight UTC.
-  // Israel is UTC+2 (winter) / UTC+3 (summer) — to be safe, count rows with sent_at >= now-26h grouped by IL date.
-  const total = await d1First(env,
-    "SELECT COUNT(*) AS c FROM alerts_sent WHERE telegram_id = ?",
-    [chatId]);
+  }).format(new Date());
+  const total = await d1First(env, "SELECT COUNT(*) AS c FROM alerts_sent WHERE telegram_id = ?", [chatId]);
   const today = await d1First(env,
     `SELECT COUNT(*) AS c FROM alerts_sent
      WHERE telegram_id = ?
-       AND date(datetime(sent_at, '+3 hours')) = ?`,
-    [chatId, ilDateStr]);
-  return { today: today ? today.c : 0, total: total ? total.c : 0 };
+       AND date(datetime(sent_at, '+3 hours')) = ?`, [chatId, ilDateStr]);
+  const last7 = await d1First(env,
+    `SELECT COUNT(*) AS c FROM alerts_sent
+     WHERE telegram_id = ? AND sent_at >= datetime('now', '-7 days')`, [chatId]);
+  const lastAt = await d1First(env,
+    `SELECT MAX(sent_at) AS t FROM alerts_sent WHERE telegram_id = ?`, [chatId]);
+  return {
+    today: today ? today.c : 0,
+    total: total ? total.c : 0,
+    last7: last7 ? last7.c : 0,
+    lastAt: lastAt ? lastAt.t : null,
+  };
 }
 
 async function saveFeedback(env, chatId, content) {
@@ -571,6 +572,18 @@ function renderUserBlock(id, p, status, dot, subscribed, alertCounts) {
   const isAdmin = id === ADMIN_CHAT_ID ? " 👑" : "";
   const lvls = p ? getLevels(p) : [];
   const alertBadge = status === "פעיל" ? (subscribed ? "🔔" : "🔕 השהה התראות") : "";
+
+  // Health: only flag fully-onboarded subscribed users.
+  const onboarded = p && p.full_name && p.address && lvls.length && p.direction && p.spots_threshold;
+  let health = null;
+  if (status === "פעיל" && subscribed && onboarded && alertCounts) {
+    if (alertCounts.last7 === 0) {
+      health = `⚠ <b>0 התראות ב-7 ימים אחרונים</b> — ההגדרות אולי מצמצמות מדי (סף ${p.spots_threshold}+)`;
+    } else if (alertCounts.last7 < 2) {
+      health = `🟡 רק ${alertCounts.last7} התראות ב-7 ימים — שווה לשקול להוריד את הסף`;
+    }
+  }
+
   const lines = [];
   lines.push(`${dot} <b>${name}</b>${isAdmin} — ${uname}`);
   lines.push(`<code>${id}</code> · <i>${status}</i>${alertBadge ? `  ${alertBadge}` : ""}`);
@@ -580,9 +593,10 @@ function renderUserBlock(id, p, status, dot, subscribed, alertCounts) {
   }
   if (p && p.address) lines.push(`כתובת: ${p.address}`);
   if (alertCounts) {
-    lines.push(`התראות: היום ${alertCounts.today} · סה"כ ${alertCounts.total}`);
+    lines.push(`התראות: היום ${alertCounts.today} · 7 ימים ${alertCounts.last7} · סה"כ ${alertCounts.total}`);
   }
   if (p && p.cmd_count) lines.push(`פקודות: ${p.cmd_count}`);
+  if (health) lines.push(health);
   return lines.join("\n");
 }
 
