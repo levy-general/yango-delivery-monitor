@@ -23,7 +23,21 @@ const SRF_URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show
 // Match is exact (case-insensitive) on the original title from the site.
 const TITLE_OVERRIDES = {
   "2b or not to be - barrel fest": "B2B (B2+B3)",
+  "t-time mega turns (new t1+t2)": "T-Times (T1+T2)",
+  "t-times pro carves (new t2+t3)": "T-Times Pro (T2+T3)",
+  "malibu turns (new m3+m4)": "Malibu (M3+M4)",
+  "new advanced carves (t1 only)": "Advanced (T1)",
+  "new advanced carves (only t1)": "Advanced (T1)",
+  "fifty/fifty (new t1+b1)": "50/50 (T1+B1)",
+  "secret spot (new m3)": "Secret (M3)",
 };
+
+// Unicode sans-serif bold digits: render bold inside Telegram inline buttons
+// where HTML markup is not allowed.
+const BOLD_DIGITS = ["𝟬","𝟭","𝟮","𝟯","𝟰","𝟱","𝟲","𝟳","𝟴","𝟵"];
+function boldNum(n) {
+  return String(n).split("").map((c) => /\d/.test(c) ? BOLD_DIGITS[Number(c)] : c).join("");
+}
 
 function displayTitle(raw) {
   if (!raw) return "";
@@ -1119,7 +1133,8 @@ async function showSessionsForDate(env, chatId, dayKey) {
 
 // One inline-keyboard button per session — opens the tracked registration link.
 function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
-  // Each row identifies time, level, (side if user wanted both), title, capacity.
+  // Compact format: "📝 HH:MM · TITLE · 𝗦𝗣𝗢𝗧𝗦"
+  // Level is implied by the user's filter; side appears only if direction=both.
   const showSide = (prefs.direction === "both");
   const rows = sessions.slice(0, 25).map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
@@ -1127,14 +1142,13 @@ function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
     }).format(new Date(s.start));
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = displayTitle(s.title);
-    // Budget the remaining width on the title.
-    const lvlPart = `L${s.level}` + (showSide ? ` ${side}` : "");
-    const fixed = `📝 ${time} · ${lvlPart} ·  · ${s.spots} פנוי`.length;  // rough
-    const titleMax = Math.max(8, 50 - fixed);
-    const title = cleanTitle.length > titleMax
-      ? cleanTitle.slice(0, titleMax - 1) + "…"
+    const sidePart = showSide ? ` ${side}` : "";
+    // Stay well within mobile button width.
+    const TITLE_MAX = 24;
+    const title = cleanTitle.length > TITLE_MAX
+      ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
       : cleanTitle;
-    const label = `📝 ${time} · ${lvlPart} · ${title} · ${s.spots} פנוי`;
+    const label = `📝 ${time}${sidePart} · ${title} · ${boldNum(s.spots)}`;
     return [{ text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
   });
   return { inline_keyboard: rows };
