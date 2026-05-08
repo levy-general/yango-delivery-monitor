@@ -196,6 +196,25 @@ def telegram_send(chat_id: int, text: str) -> None:
         print(f"send to {chat_id} failed: {e}", file=sys.stderr)
 
 
+def report_alert_sent(chat_id: int, kind: str, session_id: str | None = None) -> None:
+    """Tell the worker we sent an alert so /list can show daily/total counts."""
+    if not PUSH_SECRET:
+        return
+    try:
+        http_request(
+            f"{WORKER_URL}/alert_sent",
+            data={"chat_id": chat_id, "kind": kind, "session_id": session_id},
+            headers={
+                "Content-Type": "application/json",
+                "X-Auth": PUSH_SECRET,
+                "User-Agent": "monitor-srf/1.0",
+            },
+            method="POST",
+        )
+    except Exception as e:
+        print(f"alert_sent report failed: {e}", file=sys.stderr)
+
+
 # ---------- State ----------
 def load_state() -> dict:
     if STATE_PATH.exists():
@@ -277,6 +296,7 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
                 f"<a href=\"{register_url}\">לרשום עכשיו →</a>"
             )
             telegram_send(chat_id, msg)
+            report_alert_sent(chat_id, f"lead{lead}", s["id"])
             alerted.add(key)
             print(f"  → ALERT to {chat_id} for {key}")
 
@@ -333,6 +353,7 @@ def process_user_summary(user: dict, sessions: list[dict], state: dict, force: b
         if matching else "אין סשנים מחר."
     )
     telegram_send(chat_id, header + body)
+    report_alert_sent(chat_id, "summary")
     user_state["last_summary_date"] = now.date().isoformat()
     print(f"  → SUMMARY to {chat_id} ({len(matching)} sessions)")
 

@@ -180,6 +180,36 @@ async function cancelAlert(env, chatId, alertId) {
   );
 }
 
+async function logAlertSent(env, chatId, kind, sessionId = null) {
+  if (!env.DB) return;
+  await d1Run(env,
+    "INSERT INTO alerts_sent (telegram_id, kind, session_id) VALUES (?, ?, ?)",
+    [chatId, kind, sessionId]
+  );
+}
+
+async function getAlertCounts(env, chatId) {
+  if (!env.DB) return { today: 0, total: 0 };
+  // IL day boundaries: today's midnight in Asia/Jerusalem.
+  const ilNow = new Date();
+  const ilDateStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(ilNow);  // YYYY-MM-DD
+  // SQLite stores TEXT timestamps in UTC; offset 03:00 = winter, 02:00 = summer.
+  // Use the IL day as a substring match on the local-time string we passed.
+  // Simpler: compute count of rows with sent_at >= today's midnight UTC.
+  // Israel is UTC+2 (winter) / UTC+3 (summer) — to be safe, count rows with sent_at >= now-26h grouped by IL date.
+  const total = await d1First(env,
+    "SELECT COUNT(*) AS c FROM alerts_sent WHERE telegram_id = ?",
+    [chatId]);
+  const today = await d1First(env,
+    `SELECT COUNT(*) AS c FROM alerts_sent
+     WHERE telegram_id = ?
+       AND date(datetime(sent_at, '+3 hours')) = ?`,
+    [chatId, ilDateStr]);
+  return { today: today ? today.c : 0, total: total ? total.c : 0 };
+}
+
 async function saveFeedback(env, chatId, content) {
   if (!env.DB) return null;
   const r = await d1Run(env,
@@ -258,6 +288,7 @@ async function fireDueHuntAlerts(env) {
         disable_web_page_preview: true,
       });
       await d1Run(env, "UPDATE alerts SET is_active=0, notified_at=datetime('now') WHERE id=?", [a.alert_id]);
+      await logAlertSent(env, a.telegram_id, "hunt", match.id);
       fired++;
     } catch (e) {
       console.error("hunt fire failed:", e);
@@ -373,6 +404,7 @@ async function processDueFollowups(env) {
           { text: "❌ לא", callback_data: `reg:no:${f.session_id}` },
         ]] },
       });
+      await logAlertSent(env, f.chat_id, "followup", f.session_id);
       sent++;
     } catch (e) {
       console.error("followup send failed:", e);
@@ -532,7 +564,7 @@ function userActionKeyboard(id, status, p) {
   ] };
 }
 
-function renderUserBlock(id, p, status, dot, subscribed) {
+function renderUserBlock(id, p, status, dot, subscribed, alertCounts) {
   const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
   const name = (p && p.full_name) || tgName || "(לא הזין שם)";
   const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
@@ -547,6 +579,9 @@ function renderUserBlock(id, p, status, dot, subscribed) {
       (p.spots_threshold ? `  · סף: ${p.spots_threshold}+` : ""));
   }
   if (p && p.address) lines.push(`כתובת: ${p.address}`);
+  if (alertCounts) {
+    lines.push(`התראות: היום ${alertCounts.today} · סה"כ ${alertCounts.total}`);
+  }
   if (p && p.cmd_count) lines.push(`פקודות: ${p.cmd_count}`);
   return lines.join("\n");
 }
@@ -559,27 +594,31 @@ async function renderUserList(env, chatId) {
 
   let nG = 0, nR = 0, nPaused = 0;
   const items = [];
+  let totalAlertsToday = 0;
   for (const id of all) {
     const p = await getUserPrefs(env, id);
     const { status, dot } = await userStatus(env, id);
     const subscribed = users.includes(id);
+    const alertCounts = await getAlertCounts(env, id);
+    totalAlertsToday += alertCounts.today;
     if (dot === "🟢") {
       nG++;
       if (!subscribed) nPaused++;
     } else nR++;
-    items.push({ id, p, status, dot, subscribed });
+    items.push({ id, p, status, dot, subscribed, alertCounts });
   }
 
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text: `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🔴 ${nR}` +
-      (nPaused ? `  ·  🔕 השהה התראות: ${nPaused}` : ""),
+      (nPaused ? `  ·  🔕 השהה התראות: ${nPaused}` : "") +
+      `\n📨 התראות שנשלחו היום: <b>${totalAlertsToday}</b>`,
     parse_mode: "HTML",
   });
-  for (const { id, p, status, dot, subscribed } of items) {
+  for (const { id, p, status, dot, subscribed, alertCounts } of items) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: renderUserBlock(id, p, status, dot, subscribed),
+      text: renderUserBlock(id, p, status, dot, subscribed, alertCounts),
       parse_mode: "HTML",
       reply_markup: userActionKeyboard(id, status, p),
     });
@@ -1893,6 +1932,16 @@ export default {
           "Content-Disposition": 'attachment; filename="surf-bot-events.json"',
         },
       });
+    }
+
+    if (url.pathname === "/alert_sent" && request.method === "POST") {
+      const auth = request.headers.get("X-Auth") || "";
+      if (!env.PUSH_SECRET || auth !== env.PUSH_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const { chat_id, kind, session_id } = await request.json();
+      await logAlertSent(env, chat_id, kind, session_id || null);
+      return new Response("ok");
     }
 
     if (url.pathname === "/sessions" && request.method === "POST") {
