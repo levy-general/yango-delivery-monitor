@@ -180,6 +180,40 @@ async function cancelAlert(env, chatId, alertId) {
   );
 }
 
+// Per-user opaque token used in click-tracking URLs (replaces chat_id).
+async function ensureClickToken(env, chatId) {
+  if (!env.DB) return null;
+  const row = await d1First(env, "SELECT click_token FROM users WHERE telegram_id = ?", [chatId]);
+  if (row && row.click_token) return row.click_token;
+  const token = Math.random().toString(36).slice(2, 10);
+  await d1Run(env, "UPDATE users SET click_token = ? WHERE telegram_id = ?", [token, chatId]);
+  return token;
+}
+
+async function chatIdFromToken(env, token) {
+  if (!env.DB) return null;
+  const r = await d1First(env, "SELECT telegram_id FROM users WHERE click_token = ?", [token]);
+  return r ? r.telegram_id : null;
+}
+
+async function getClickCounts(env, chatId) {
+  // Click events live in KV events log.
+  const events = await getEvents(env, chatId);
+  const ilDateStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+  let total = 0, today = 0;
+  for (const e of events) {
+    if (e.action !== "click") continue;
+    total++;
+    const eventDate = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(new Date(e.ts));
+    if (eventDate === ilDateStr) today++;
+  }
+  return { today, total };
+}
+
 async function logAlertSent(env, chatId, kind, sessionId = null) {
   if (!env.DB) return;
   await d1Run(env,
@@ -565,7 +599,7 @@ function userActionKeyboard(id, status, p) {
   ] };
 }
 
-function renderUserBlock(id, p, status, dot, subscribed, alertCounts) {
+function renderUserBlock(id, p, status, dot, subscribed, alertCounts, clickCounts) {
   const tgName = p && [p.tg_first_name, p.tg_last_name].filter(Boolean).join(" ");
   const name = (p && p.full_name) || tgName || "(לא הזין שם)";
   const uname = p && p.username ? `@${p.username}` : "(אין שם משתמש)";
@@ -595,6 +629,9 @@ function renderUserBlock(id, p, status, dot, subscribed, alertCounts) {
   if (alertCounts) {
     lines.push(`התראות: היום ${alertCounts.today} · 7 ימים ${alertCounts.last7} · סה"כ ${alertCounts.total}`);
   }
+  if (clickCounts) {
+    lines.push(`קליקים לאתר: היום ${clickCounts.today} · סה"כ ${clickCounts.total}`);
+  }
   if (p && p.cmd_count) lines.push(`פקודות: ${p.cmd_count}`);
   if (health) lines.push(health);
   return lines.join("\n");
@@ -608,31 +645,35 @@ async function renderUserList(env, chatId) {
 
   let nG = 0, nR = 0, nPaused = 0;
   const items = [];
-  let totalAlertsToday = 0;
+  let totalAlertsToday = 0, totalClicksToday = 0, totalClicksAll = 0;
   for (const id of all) {
     const p = await getUserPrefs(env, id);
     const { status, dot } = await userStatus(env, id);
     const subscribed = users.includes(id);
     const alertCounts = await getAlertCounts(env, id);
+    const clickCounts = await getClickCounts(env, id);
     totalAlertsToday += alertCounts.today;
+    totalClicksToday += clickCounts.today;
+    totalClicksAll += clickCounts.total;
     if (dot === "🟢") {
       nG++;
       if (!subscribed) nPaused++;
     } else nR++;
-    items.push({ id, p, status, dot, subscribed, alertCounts });
+    items.push({ id, p, status, dot, subscribed, alertCounts, clickCounts });
   }
 
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text: `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🔴 ${nR}` +
       (nPaused ? `  ·  🔕 השהה התראות: ${nPaused}` : "") +
-      `\n📨 התראות שנשלחו היום: <b>${totalAlertsToday}</b>`,
+      `\n📨 התראות שנשלחו היום: <b>${totalAlertsToday}</b>` +
+      `\n🔗 קליקים לאתר: היום <b>${totalClicksToday}</b> · סה"כ <b>${totalClicksAll}</b>`,
     parse_mode: "HTML",
   });
-  for (const { id, p, status, dot, subscribed, alertCounts } of items) {
+  for (const { id, p, status, dot, subscribed, alertCounts, clickCounts } of items) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: renderUserBlock(id, p, status, dot, subscribed, alertCounts),
+      text: renderUserBlock(id, p, status, dot, subscribed, alertCounts, clickCounts),
       parse_mode: "HTML",
       reply_markup: userActionKeyboard(id, status, p),
     });
@@ -1217,27 +1258,42 @@ async function showSessionsForDate(env, chatId, dayKey) {
 }
 
 // One inline-keyboard button per session — opens the tracked registration link.
-function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
-  // Each row gets the registration link + a 🔔 follow button for that session.
+async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {}) {
+  // Layout:
+  //   Each session → a full-width registration row (long title fits cleanly)
+  //   At the end → a single row of compact 🔔 follow buttons (one per session)
+  const token = await ensureClickToken(env, chatId);
   const showSide = (prefs.direction === "both");
-  const rows = sessions.slice(0, 25).map((s) => {
+  const limited = sessions.slice(0, 25);
+
+  const sessionRows = limited.map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = displayTitle(s.title);
     const sidePart = showSide ? ` ${side}` : "";
-    const TITLE_MAX = 22;
+    const TITLE_MAX = 32;  // wide row → can fit longer title now
     const title = cleanTitle.length > TITLE_MAX
       ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
       : cleanTitle;
     const label = `📝 ${time}${sidePart} · ${title} · ${boldNum(s.spots)}`;
-    return [
-      { text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` },
-      { text: "🔔", callback_data: `huntsess:${s.id}` },
-    ];
+    return [{ text: label, url: `${workerOrigin}/r/${s.id}?u=${token}&lead=manual` }];
   });
-  return { inline_keyboard: rows };
+
+  // Bell row — chunk in groups of 4 to keep buttons readable.
+  const bellsLine = limited.map((s) => {
+    const time = new Intl.DateTimeFormat("he-IL", {
+      timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
+    }).format(new Date(s.start));
+    return { text: `🔔 ${time}`, callback_data: `huntsess:${s.id}` };
+  });
+  const bellRows = [];
+  for (let i = 0; i < bellsLine.length; i += 4) {
+    bellRows.push(bellsLine.slice(i, i + 4));
+  }
+
+  return { inline_keyboard: [...sessionRows, ...bellRows] };
 }
 
 // Time-only row (date is shown in the header).
@@ -1304,7 +1360,7 @@ async function cmdToday(env, chatId) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "👇 בחר סשן להרשמה",
-      reply_markup: sessionsKeyboard(chatId, bookable, "https://surf-bot.shayko22.workers.dev", prefs),
+      reply_markup: await sessionsKeyboard(env, chatId, bookable, "https://surf-bot.shayko22.workers.dev", prefs),
     });
   } else {
     await tg(env, "sendMessage", {
@@ -1580,7 +1636,7 @@ async function handleUpdate(env, update) {
             chat_id: chatId,
             text: `${dateLine}\n👇 בחר סשן להרשמה`,
             parse_mode: "HTML",
-            reply_markup: sessionsKeyboard(chatId, result.sessions, origin, prefs),
+            reply_markup: await sessionsKeyboard(env, chatId, result.sessions, origin, prefs),
           });
         } else {
           await tg(env, "sendMessage", {
@@ -1872,22 +1928,32 @@ export default {
       return Response.json(await getUserPrefs(env, id));
     }
 
-    // Click-tracking redirect for alert links.
-    // /r/<chat_id>/<session_id> → log click then 302 to SRF Park.
-    const m = url.pathname.match(/^\/r\/(\d+)\/([^/]+)$/);
-    if (m) {
-      const chatId = parseInt(m[1], 10);
-      const sessionId = m[2];
+    // Click-tracking redirect for alert links. Two formats supported:
+    //   /r/<session_id>?u=<token>  ← preferred (clean URL, no chat_id leaked)
+    //   /r/<chat_id>/<session_id>  ← legacy (still works for old links in chat history)
+    let mNew = url.pathname.match(/^\/r\/([^/]+)$/);
+    let mOld = url.pathname.match(/^\/r\/(\d+)\/([^/]+)$/);
+    let chatId = null, sessionId = null;
+    if (mOld) {
+      chatId = parseInt(mOld[1], 10);
+      sessionId = mOld[2];
+    } else if (mNew) {
+      sessionId = mNew[1];
+      const tok = url.searchParams.get("u");
+      if (tok) chatId = await chatIdFromToken(env, tok);
+    }
+    if (sessionId) {
       const lead = url.searchParams.get("lead") || "";
       const sessions = await getSessions(env);
       const s = sessions.find((x) => x.id === sessionId);
       const detail = s
         ? { session_id: sessionId, session_start: s.start, session_spots_at_click: s.spots, level: s.level, area: s.area, lead }
         : { session_id: sessionId, lead };
-      await logEvent(env, chatId, "click", detail);
-      // Schedule a follow-up survey 30 min after session start (fallback: 30 min from now).
-      const due = (s ? s.start : Date.now()) + 30 * 60 * 1000;
-      await queueFollowup(env, { chat_id: chatId, session_id: sessionId, due_ts: due, click_ts: Date.now(), session_start: s ? s.start : null, session_title: s ? s.title : "", level: s ? s.level : null, area: s ? s.area : "" });
+      if (chatId) {
+        await logEvent(env, chatId, "click", detail);
+        const due = (s ? s.start : Date.now()) + 30 * 60 * 1000;
+        await queueFollowup(env, { chat_id: chatId, session_id: sessionId, due_ts: due, click_ts: Date.now(), session_start: s ? s.start : null, session_title: s ? s.title : "", level: s ? s.level : null, area: s ? s.area : "" });
+      }
       return Response.redirect(SRF_URL, 302);
     }
 
