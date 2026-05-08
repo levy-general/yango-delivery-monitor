@@ -1009,18 +1009,38 @@ async function cmdAlerts(env, chatId) {
   if (!rows.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "אין לך התראות פעילות.\nבחר סשן ב-/today או /date ולחץ '🔔 התראה כשמתפנה'.",
+      text:
+        "אין לך מעקבים פעילים.\n" +
+        "ב-/today או /date לחץ על 🔔 ליד סשן כדי לעקוב אחריו.",
     });
     return;
   }
-  const lines = ["🔔 <b>ההתראות שלך</b>", ""];
+  // Enrich session-specific alerts with session details from KV.
+  const sessions = await getSessions(env);
+  const sMap = Object.fromEntries(sessions.map((s) => [s.id, s]));
+
+  const lines = ["🔔 <b>סשנים שאתה עוקב אחריהם</b>", ""];
   const buttons = [];
   for (const a of rows) {
-    const lvl = a.level ? `L${a.level}` : "כל הרמות";
-    const side = a.direction === "left" ? "שמאל" : a.direction === "right" ? "ימין" : "שניהם";
-    const date = a.target_date || "כל יום";
-    const time = a.target_time ? ` ${a.target_time}` : "";
-    lines.push(`#${a.id} · ${lvl} ${side} · ${date}${time}`);
+    let label;
+    if (a.session_id && sMap[a.session_id]) {
+      const s = sMap[a.session_id];
+      const time = new Intl.DateTimeFormat("he-IL", {
+        timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
+        day: "2-digit", month: "2-digit",
+      }).format(new Date(s.start));
+      const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
+      label = `${time} · L${s.level} ${side} · ${displayTitle(s.title)} · נותרו ${s.spots}`;
+    } else if (a.session_id) {
+      label = `סשן #${a.session_id} (לא במאגר העדכני)`;
+    } else {
+      // Generic level/direction/date alert (legacy / from "no results" flow)
+      const lvl = a.level ? `L${a.level}` : "כל הרמות";
+      const side = a.direction === "left" ? "שמאל" : a.direction === "right" ? "ימין" : "שניהם";
+      const date = a.target_date || "כל יום";
+      label = `${lvl} ${side} · ${date}`;
+    }
+    lines.push(`#${a.id} · ${label}`);
     buttons.push([{ text: `❌ בטל #${a.id}`, callback_data: `cancelalert:${a.id}` }]);
   }
   await tg(env, "sendMessage", {
@@ -1051,8 +1071,6 @@ const CMDS_PAUSED = [
 
 const ADMIN_TOOLS = [
   { command: "list", description: "[אדמין] רשימת משתמשים" },
-  { command: "feedbacks", description: "[אדמין] פידבקים אחרונים" },
-  { command: "fbdone", description: "[אדמין] סימון פידבק כטופל" },
   { command: "events", description: "[אדמין] אירועי משתמש" },
   { command: "export", description: "[אדמין] סיכום אירועים" },
   { command: "approve", description: "[אדמין] אישור chat_id" },
@@ -1147,8 +1165,7 @@ async function showSessionsForDate(env, chatId, dayKey) {
 
 // One inline-keyboard button per session — opens the tracked registration link.
 function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
-  // Compact format: "📝 HH:MM · TITLE · 𝗦𝗣𝗢𝗧𝗦"
-  // Level is implied by the user's filter; side appears only if direction=both.
+  // Each row gets the registration link + a 🔔 follow button for that session.
   const showSide = (prefs.direction === "both");
   const rows = sessions.slice(0, 25).map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
@@ -1157,13 +1174,15 @@ function sessionsKeyboard(chatId, sessions, workerOrigin, prefs = {}) {
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = displayTitle(s.title);
     const sidePart = showSide ? ` ${side}` : "";
-    // Stay well within mobile button width.
-    const TITLE_MAX = 24;
+    const TITLE_MAX = 22;
     const title = cleanTitle.length > TITLE_MAX
       ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
       : cleanTitle;
     const label = `📝 ${time}${sidePart} · ${title} · ${boldNum(s.spots)}`;
-    return [{ text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` }];
+    return [
+      { text: label, url: `${workerOrigin}/r/${chatId}/${s.id}?lead=manual` },
+      { text: "🔔", callback_data: `huntsess:${s.id}` },
+    ];
   });
   return { inline_keyboard: rows };
 }
@@ -1285,6 +1304,27 @@ async function handleUpdate(env, update) {
     const chatId = cb.message.chat.id;
     const msgId = cb.message.message_id;
     const data = cb.data || "";
+
+    // Per-session follow: 🔔 button on each session row.
+    if (data.startsWith("huntsess:")) {
+      const sessionId = data.split(":")[1];
+      // Avoid duplicates: check whether user already has an active alert here.
+      const existing = await d1First(env,
+        `SELECT a.id FROM alerts a JOIN users u ON a.user_id = u.id
+         WHERE u.telegram_id = ? AND a.session_id = ? AND a.is_active = 1`,
+        [chatId, sessionId]);
+      if (existing) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "כבר עוקב 🔔" });
+        return;
+      }
+      await addHuntAlert(env, chatId, null, null, null, null, sessionId);
+      await tg(env, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: "🔔 נרשם — תקבל הודעה כשיתפנה מקום",
+        show_alert: false,
+      });
+      return;
+    }
 
     // Hunt alert: register a "notify when free" request.
     if (data.startsWith("hunt:")) {
@@ -1605,40 +1645,30 @@ async function handleUpdate(env, update) {
       await renderUserList(env, chatId);
       return;
     }
-    if (parts[0] === "/feedbacks") {
-      const rows = await listRecentFeedback(env, 20);
-      if (!rows.length) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: "אין פידבקים." });
+    if (parts[0] === "/events") {
+      const target = parts[1] ? parseInt(parts[1], 10) : NaN;
+      if (!Number.isFinite(target)) {
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: "שימוש: <code>/events &lt;chat_id&gt;</code>\nראה chat_id ב-/list.",
+          parse_mode: "HTML",
+        });
         return;
       }
-      const lines = [`💬 <b>פידבקים אחרונים (${rows.length})</b>`, ""];
-      for (const r of rows) {
-        const who = r.full_name || (r.username ? `@${r.username}` : `${r.telegram_id}`);
-        const flag = r.status === "acknowledged" ? "✓" : "🆕";
-        lines.push(`${flag} #${r.id} · <b>${who}</b> · <code>${r.created_at}</code>\n${r.content}\n`);
-      }
-      await tg(env, "sendMessage", {
-        chat_id: chatId,
-        text: lines.join("\n").slice(0, 4090),
-        parse_mode: "HTML",
-      });
-      return;
-    }
-    if (parts[0] === "/fbdone" && parts[1]) {
-      await markFeedbackAck(env, parseInt(parts[1], 10));
-      await tg(env, "sendMessage", { chat_id: chatId, text: `✓ סומן כטופל.` });
-      return;
-    }
-    if (parts[0] === "/events" && parts[1]) {
-      const target = parseInt(parts[1], 10);
       const events = await getEvents(env, target);
+      if (!events.length) {
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: `📜 אין אירועים עבור ${target}.`,
+        });
+        return;
+      }
       const last = events.slice(-30).reverse();
-      const tz = "Asia/Jerusalem";
       const lines = [`📜 <b>אירועים אחרונים — ${target}</b> (סה"כ ${events.length})`, ""];
       for (const e of last) {
-        const time = new Date(e.ts).toLocaleString("he-IL", { timeZone: tz });
-        const detail = e.cmd || e.data || e.text || "";
-        lines.push(`<code>${time}</code> · ${e.action}${detail ? ` · ${detail}` : ""}`);
+        const t = new Date(e.ts).toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" });
+        const detail = e.cmd || e.data || e.text || (e.matched != null ? `matched=${e.matched}` : "");
+        lines.push(`<code>${t}</code> · ${e.action}${detail ? ` · ${detail}` : ""}`);
       }
       await tg(env, "sendMessage", {
         chat_id: chatId,
