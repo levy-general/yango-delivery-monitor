@@ -1954,7 +1954,9 @@ export default {
         const due = (s ? s.start : Date.now()) + 30 * 60 * 1000;
         await queueFollowup(env, { chat_id: chatId, session_id: sessionId, due_ts: due, click_ts: Date.now(), session_start: s ? s.start : null, session_title: s ? s.title : "", level: s ? s.level : null, area: s ? s.area : "" });
       }
-      return Response.redirect(SRF_URL, 302);
+      // SRF auto-opens the booking modal when ?sid=<id> is present.
+      const target = `https://www.srfparktlv.co.il/sessions/?sid=${encodeURIComponent(sessionId)}&show-children=false&show-adults=false&zone=reef-right%7Creef-left`;
+      return Response.redirect(target, 302);
     }
 
     if (url.pathname === "/events") {
