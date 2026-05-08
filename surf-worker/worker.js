@@ -1259,41 +1259,35 @@ async function showSessionsForDate(env, chatId, dayKey) {
 
 // One inline-keyboard button per session — opens the tracked registration link.
 async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {}) {
-  // Layout:
-  //   Each session → a full-width registration row (long title fits cleanly)
-  //   At the end → a single row of compact 🔔 follow buttons (one per session)
+  // Each session occupies one row with 3 cells: register text spans 2 cells
+  // (same URL on both → ~67% width), bell takes the 3rd cell (~33%).
+  // Register button uses Telegram Web App so no "Open link?" popup appears.
   const token = await ensureClickToken(env, chatId);
   const showSide = (prefs.direction === "both");
   const limited = sessions.slice(0, 25);
 
-  const sessionRows = limited.map((s) => {
+  const rows = limited.map((s) => {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = displayTitle(s.title);
     const sidePart = showSide ? ` ${side}` : "";
-    const TITLE_MAX = 32;  // wide row → can fit longer title now
+    const TITLE_MAX = 22;
     const title = cleanTitle.length > TITLE_MAX
       ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
       : cleanTitle;
-    const label = `📝 ${time}${sidePart} · ${title} · ${boldNum(s.spots)}`;
-    return [{ text: label, url: `${workerOrigin}/r/${s.id}?u=${token}&lead=manual` }];
+    // Split the register label across 2 cells so the bell ends up at ~33%.
+    const labelLeft = `📝 ${time}${sidePart} · ${title}`;
+    const labelRight = `${boldNum(s.spots)} פנוי`;
+    const registerUrl = `${workerOrigin}/r/${s.id}?u=${token}&lead=manual`;
+    return [
+      { text: labelLeft, web_app: { url: registerUrl } },
+      { text: labelRight, web_app: { url: registerUrl } },
+      { text: "🔔", callback_data: `huntsess:${s.id}` },
+    ];
   });
-
-  // Bell row — chunk in groups of 4 to keep buttons readable.
-  const bellsLine = limited.map((s) => {
-    const time = new Intl.DateTimeFormat("he-IL", {
-      timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
-    }).format(new Date(s.start));
-    return { text: `🔔 ${time}`, callback_data: `huntsess:${s.id}` };
-  });
-  const bellRows = [];
-  for (let i = 0; i < bellsLine.length; i += 4) {
-    bellRows.push(bellsLine.slice(i, i + 4));
-  }
-
-  return { inline_keyboard: [...sessionRows, ...bellRows] };
+  return { inline_keyboard: rows };
 }
 
 // Time-only row (date is shown in the header).
