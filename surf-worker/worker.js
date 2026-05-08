@@ -43,7 +43,12 @@ function displayTitle(raw) {
   if (!raw) return "";
   const key = raw.trim().toLowerCase();
   if (TITLE_OVERRIDES[key]) return TITLE_OVERRIDES[key];
-  return raw.replace(/^L\d+\s*[-–—]\s*/, "").trim();
+  // Strip the redundant SRF prefix ("L6 - ") and the "(New ...)" wrapper
+  // so "L6 Pro (New T2+B2)" → "L6 Pro (T2+B2)".
+  return raw
+    .replace(/^L\d+\s*[-–—]\s*/, "")
+    .replace(/\(\s*New\s+/gi, "(")
+    .trim();
 }
 
 // ---------- Telegram ----------
