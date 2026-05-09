@@ -1259,34 +1259,27 @@ async function showSessionsForDate(env, chatId, dayKey) {
 
 // One inline-keyboard button per session — opens the tracked registration link.
 async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {}) {
-  // Each session occupies one row with 3 cells: register text spans 2 cells
-  // (same URL on both → ~67% width), bell takes the 3rd cell (~33%).
-  // Register button uses Telegram Web App so no "Open link?" popup appears.
+  // Each session = 2 stacked rows for full readability:
+  //   row 1: full-width register button (whole title visible)
+  //   row 2: full-width 🔔 follow button (with the session time so it's clear
+  //          which session the bell refers to)
   const token = await ensureClickToken(env, chatId);
   const showSide = (prefs.direction === "both");
   const limited = sessions.slice(0, 25);
 
-  const rows = limited.map((s) => {
+  const rows = [];
+  for (const s of limited) {
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = displayTitle(s.title);
     const sidePart = showSide ? ` ${side}` : "";
-    const TITLE_MAX = 22;
-    const title = cleanTitle.length > TITLE_MAX
-      ? cleanTitle.slice(0, TITLE_MAX - 1) + "…"
-      : cleanTitle;
-    // Split the register label across 2 cells so the bell ends up at ~33%.
-    const labelLeft = `📝 ${time}${sidePart} · ${title}`;
-    const labelRight = `${boldNum(s.spots)} פנוי`;
     const registerUrl = `${workerOrigin}/r/${s.id}?u=${token}&lead=manual`;
-    return [
-      { text: labelLeft, web_app: { url: registerUrl } },
-      { text: labelRight, web_app: { url: registerUrl } },
-      { text: "🔔", callback_data: `huntsess:${s.id}` },
-    ];
-  });
+    const registerLabel = `📝 ${time}${sidePart} · ${cleanTitle} · ${boldNum(s.spots)} פנוי`;
+    rows.push([{ text: registerLabel, web_app: { url: registerUrl } }]);
+    rows.push([{ text: `🔔 עקוב אחרי ${time}`, callback_data: `huntsess:${s.id}` }]);
+  }
   return { inline_keyboard: rows };
 }
 
