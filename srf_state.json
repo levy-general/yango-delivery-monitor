@@ -1,23 +1,14 @@
 {
   "328859712": {
-    "alerted_ids": [
-      "24826_105",
-      "24826_75"
-    ],
+    "alerted_ids": [],
     "last_summary_date": "2026-05-09"
   },
   "481683634": {
-    "alerted_ids": [
-      "24835_105",
-      "24835_75"
-    ],
+    "alerted_ids": [],
     "last_summary_date": "2026-05-09"
   },
   "555664436": {
-    "alerted_ids": [
-      "24846_105",
-      "24846_75"
-    ],
+    "alerted_ids": [],
     "last_summary_date": "2026-05-09"
   }
 }
