@@ -1277,7 +1277,7 @@ async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {})
     const sidePart = showSide ? ` ${side}` : "";
     const registerUrl = `${workerOrigin}/r/${s.id}?u=${token}&lead=manual`;
     const registerLabel = `📝 ${time}${sidePart} · ${cleanTitle} · ${boldNum(s.spots)} פנוי`;
-    rows.push([{ text: registerLabel, web_app: { url: registerUrl } }]);
+    rows.push([{ text: registerLabel, url: registerUrl }]);
     rows.push([{ text: `🔔 עקוב אחרי ${time}`, callback_data: `huntsess:${s.id}` }]);
   }
   return { inline_keyboard: rows };
