@@ -384,9 +384,9 @@ def main():
     users = fetch_users()
     print(f"Subscribed users: {len(users)}")
 
-    # Daily summary path runs always (it self-gates by time/day).
-    for user in users:
-        process_user_summary(user, sessions, state)
+    # Daily 20:00 summary disabled per user request — keep helper for future re-enable.
+    # for user in users:
+    #     process_user_summary(user, sessions, state)
 
     if alerts_disabled_today():
         print("Fri/Sat — alerts disabled.")
