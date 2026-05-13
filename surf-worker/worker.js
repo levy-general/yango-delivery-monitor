@@ -1986,36 +1986,7 @@ export default {
         fromDateParam = `&from_date=${encodeURIComponent(dd)}`;
       }
       const target = `https://www.srfparktlv.co.il/sessions/?sid=${encodeURIComponent(sessionId)}${fromDateParam}&show-children=false&show-adults=false&zone=reef-right%7Creef-left`;
-
-      // Web App buttons can't follow 302 to an external domain — serve an
-      // HTML bridge that uses Telegram's openLink to launch the system
-      // browser, then closes the Mini App. Falls back to a regular redirect
-      // for users who reach the URL outside a Web App context.
-      const escaped = target.replace(/"/g, "&quot;");
-      const html = `<!doctype html>
-<html lang="he"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>פותח SRF…</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script>
-  (function () {
-    var url = "${escaped}";
-    try {
-      if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) {
-        window.Telegram.WebApp.openLink(url, { try_instant_view: false });
-        setTimeout(function () { window.Telegram.WebApp.close(); }, 200);
-        return;
-      }
-    } catch (e) {}
-    window.location.replace(url);
-  })();
-</script>
-<meta http-equiv="refresh" content="0;url=${escaped}">
-</head><body><p style="font-family:sans-serif;padding:1rem;">פותח SRF…</p></body></html>`;
-      return new Response(html, {
-        status: 200,
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
+      return Response.redirect(target, 302);
     }
 
     if (url.pathname === "/events") {
