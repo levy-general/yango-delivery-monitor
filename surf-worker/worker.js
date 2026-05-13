@@ -1704,15 +1704,20 @@ async function handleUpdate(env, update) {
       await setUserMenu(env, chatId, false);
       await addKnownUser(env, chatId);
       if (firstCompletion && chatId !== ADMIN_CHAT_ID) {
-        // Only now — after the user actually filled the whole profile —
-        // tell the admin a real new user joined.
         try {
+          // Name itself becomes a tappable mention via tg://user?id=, so even
+          // users without a public @username are reachable in one tap.
+          const displayName = prefs.full_name || "משתמש";
+          const nameLink = `<a href="tg://user?id=${chatId}">${displayName}</a>`;
+          const unameLine = prefs.username
+            ? `@${prefs.username}`
+            : `<i>(אין @username — לחץ על השם לפתיחת צ'אט)</i>`;
           await tg(env, "sendMessage", {
             chat_id: ADMIN_CHAT_ID,
             text:
               `👋 <b>משתמש חדש סיים הרשמה</b>\n` +
-              `שם: ${prefs.full_name || "(?)"}\n` +
-              `שם משתמש: ${prefs.username ? "@" + prefs.username : "(אין)"}\n` +
+              `שם: ${nameLink}\n` +
+              `שם משתמש: ${unameLine}\n` +
               `כתובת: ${prefs.address || "(?)"}\n` +
               `העדפות: ${describePrefs(prefs)} · סף ${threshold}+\n` +
               `<code>${chatId}</code>`,
