@@ -1346,13 +1346,13 @@ async function cmdToday(env, chatId) {
   if (bookable.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "👇 בחר סשן להרשמה",
+      text: "🤙 מה תופס לך?",
       reply_markup: await sessionsKeyboard(env, chatId, bookable, "https://surf-bot.shayko22.workers.dev", prefs),
     });
   } else {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "אם תרצה, תקבל התראה ברגע שיתפנה מקום:",
+      text: "🌊 הים לא מחכה — תתן לי לנפנף לך כשיתפנה מקום?",
       reply_markup: huntKeyboardForPrefs(prefs, null),
     });
   }
@@ -1621,14 +1621,14 @@ async function handleUpdate(env, update) {
         if (result.sessions && result.sessions.length) {
           await tg(env, "sendMessage", {
             chat_id: chatId,
-            text: `${dateLine}\n👇 בחר סשן להרשמה`,
+            text: `${dateLine}\n🤙 איזה גל תופס לך?`,
             parse_mode: "HTML",
             reply_markup: await sessionsKeyboard(env, chatId, result.sessions, origin, prefs),
           });
         } else {
           await tg(env, "sendMessage", {
             chat_id: chatId,
-            text: `${dateLine}\nאם תרצה, תקבל התראה ברגע שיתפנה מקום ביום הזה:`,
+            text: `${dateLine}\n🌊 הים לא מחכה — תתן לי לנפנף לך כשיתפנה מקום?`,
             parse_mode: "HTML",
             reply_markup: huntKeyboardForPrefs(prefs, dayKey),
           });
