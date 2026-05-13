@@ -1787,7 +1787,8 @@ async function handleUpdate(env, update) {
       for (const id of all) {
         if (totals[id]) lines.push(`<code>${id}</code>: ${totals[id]} אירועים`);
       }
-      lines.push("", `הורדה מלאה: <a href=\"https://surf-bot.shayko22.workers.dev/events?key=PUSH_SECRET\">/events JSON</a>`);
+      const key = env.PUSH_SECRET ? encodeURIComponent(env.PUSH_SECRET) : "";
+      lines.push("", `הורדה מלאה: https://surf-bot.shayko22.workers.dev/events?key=${key}`);
       await tg(env, "sendMessage", {
         chat_id: chatId,
         text: lines.join("\n"),
