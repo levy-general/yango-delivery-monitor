@@ -641,7 +641,14 @@ async function renderUserList(env, chatId) {
   const wl = await getWhitelist(env);
   const users = await getUsers(env);
   const known = await getKnownUsers(env);
-  const all = [...new Set([...known, ...wl])];
+  // Only surface users who actually finished onboarding (or the admin).
+  const candidates = [...new Set([...known, ...wl])];
+  const all = [];
+  for (const id of candidates) {
+    if (id === ADMIN_CHAT_ID) { all.push(id); continue; }
+    const p = await getUserPrefs(env, id);
+    if (p && p.onboarded) all.push(id);
+  }
 
   let nG = 0, nR = 0, nPaused = 0;
   const items = [];
@@ -1690,9 +1697,33 @@ async function handleUpdate(env, update) {
       const prefs = (await getUserPrefs(env, chatId)) || {};
       prefs.spots_threshold = threshold;
       prefs.pending = null;
+      const firstCompletion = !prefs.onboarded;
+      prefs.onboarded = true;
       await setUserPrefs(env, chatId, prefs);
       await addUser(env, chatId);
       await setUserMenu(env, chatId, false);
+      await addKnownUser(env, chatId);
+      if (firstCompletion && chatId !== ADMIN_CHAT_ID) {
+        // Only now — after the user actually filled the whole profile —
+        // tell the admin a real new user joined.
+        try {
+          await tg(env, "sendMessage", {
+            chat_id: ADMIN_CHAT_ID,
+            text:
+              `👋 <b>משתמש חדש סיים הרשמה</b>\n` +
+              `שם: ${prefs.full_name || "(?)"}\n` +
+              `שם משתמש: ${prefs.username ? "@" + prefs.username : "(אין)"}\n` +
+              `כתובת: ${prefs.address || "(?)"}\n` +
+              `העדפות: ${describePrefs(prefs)} · סף ${threshold}+\n` +
+              `<code>${chatId}</code>`,
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: [[
+              { text: "💬 פנה למשתמש", url: prefs.username ? `https://t.me/${prefs.username}` : `tg://user?id=${chatId}` },
+              { text: "🚪 הסרה", callback_data: `udelete:${chatId}` },
+            ]] },
+          });
+        } catch (e) { console.error("admin notify failed:", e); }
+      }
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: msgId,
@@ -1834,15 +1865,11 @@ async function handleUpdate(env, update) {
     }
   }
 
-  // Auto-approve every new chat: add to whitelist, notify admin (info only).
+  // Auto-approve every new chat so they can run /start. Admin notification
+  // and inclusion in /list happen ONLY once they finish onboarding (see the
+  // threshold-selection callback). Until then the user is invisible in stats.
   if (!(await isApproved(env, chatId))) {
     await approveUser(env, chatId);
-    const seenKey = `seen:${chatId}`;
-    const already = await env.KV.get(seenKey);
-    if (!already) {
-      await env.KV.put(seenKey, "1");
-      await notifyAdminNewUser(env, msg);
-    }
   }
 
   // Mid-onboarding handlers — accept free-text input depending on stage.
