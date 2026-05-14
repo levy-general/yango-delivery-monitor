@@ -4,7 +4,9 @@
     "last_summary_date": "2026-05-10"
   },
   "481683634": {
-    "alerted_ids": [],
+    "alerted_ids": [
+      "24794_105"
+    ],
     "last_summary_date": "2026-05-10"
   },
   "555664436": {
@@ -12,6 +14,8 @@
     "last_summary_date": "2026-05-10"
   },
   "8291656711": {
-    "alerted_ids": []
+    "alerted_ids": [
+      "25524_75"
+    ]
   }
 }
