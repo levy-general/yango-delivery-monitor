@@ -966,6 +966,48 @@ async function handleNameInput(env, chatId, prefs, text) {
 }
 
 // ---------- Commands ----------
+async function handleSharedFollow(env, chatId, from, sessionId) {
+  // Friend opened /start follow_<sessionId> from a shared link.
+  // Persist Telegram identity (in case they later finish onboarding).
+  const prefs = (await getUserPrefs(env, chatId)) || {};
+  if (from) {
+    if (from.username) prefs.username = from.username;
+    if (from.first_name) prefs.tg_first_name = from.first_name;
+    if (from.last_name) prefs.tg_last_name = from.last_name;
+    await setUserPrefs(env, chatId, prefs);
+  }
+  if (!(await isApproved(env, chatId))) await approveUser(env, chatId);
+
+  // Show a preview of the session so the friend knows what they're joining.
+  const sessions = await getSessions(env);
+  const s = sessions.find((x) => x.id === sessionId);
+  if (!s) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "👋 חבר שלך הזמין אותך לעקוב אחרי סשן בסרף פארק, אבל הוא כבר לא במאגר העדכני. שלח /start כדי להמשיך רגיל.",
+    });
+    return;
+  }
+  const time = new Intl.DateTimeFormat("he-IL", {
+    timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit",
+  }).format(new Date(s.start));
+  const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text:
+      `👋 ברוך הבא ל-<b>Surf Park Alerts</b>\n\n` +
+      `חבר שיתף איתך סשן:\n` +
+      `🌊 <b>${time} · L${s.level} ${side}</b>\n` +
+      `${displayTitle(s.title)} · נותרו ${s.spots} מקומות\n\n` +
+      `רוצה שאודיע לך גם ברגע שיתפנה מקום?`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[
+      { text: "✅ כן, תעקוב גם אצלי", callback_data: `huntsess:${sessionId}` },
+      { text: "❌ לא, רק להתחיל", callback_data: `nofollow` },
+    ]] },
+  });
+}
+
 async function cmdStart(env, chatId, from) {
   const prefs = (await getUserPrefs(env, chatId)) || {};
   if (from) {
@@ -1408,24 +1450,45 @@ async function handleUpdate(env, update) {
     const msgId = cb.message.message_id;
     const data = cb.data || "";
 
+    if (data === "nofollow") {
+      await tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
+      await tg(env, "sendMessage", { chat_id: chatId, text: "סבבה. שלח /start כדי להתחיל הרשמה רגילה." });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+      return;
+    }
+
     // Per-session follow: 🔔 button on each session row.
     if (data.startsWith("huntsess:")) {
       const sessionId = data.split(":")[1];
-      // Avoid duplicates: check whether user already has an active alert here.
       const existing = await d1First(env,
         `SELECT a.id FROM alerts a JOIN users u ON a.user_id = u.id
          WHERE u.telegram_id = ? AND a.session_id = ? AND a.is_active = 1`,
         [chatId, sessionId]);
-      if (existing) {
-        await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "כבר עוקב 🔔" });
-        return;
+      if (!existing) {
+        await addHuntAlert(env, chatId, null, null, null, null, sessionId);
       }
-      await addHuntAlert(env, chatId, null, null, null, null, sessionId);
-      await tg(env, "answerCallbackQuery", {
-        callback_query_id: cb.id,
-        text: "🔔 נרשם — תקבל הודעה כשיתפנה מקום",
-        show_alert: false,
+      // Build a friendly share message + viral deep-link.
+      const sessions = await getSessions(env);
+      const s = sessions.find((x) => x.id === sessionId);
+      const time = s ? new Intl.DateTimeFormat("he-IL", {
+        timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit",
+      }).format(new Date(s.start)) : "";
+      const title = s ? displayTitle(s.title) : "סשן";
+      const side = s ? (s.area.toLowerCase().includes("left") ? "שמאל" : "ימין") : "";
+      const lvl = s ? `L${s.level}` : "";
+      const shareText = `🤙 אני עוקב אחרי סשן ${time} ${lvl} ${side} ב-${title} בסרף פארק.\nגם אתה? תלחץ על הקישור והבוט יוסיף אותך לתור.`;
+      const botLink = `https://t.me/SurfParkBot?start=follow_${sessionId}`;
+      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(botLink)}&text=${encodeURIComponent(shareText)}`;
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: existing
+          ? "כבר עוקב 🔔. רוצה לצרף חבר?"
+          : "🔔 נרשם — תקבל הודעה כשיתפנה מקום.\nרוצה לצרף חבר שיעקוב יחד?",
+        reply_markup: { inline_keyboard: [[
+          { text: "👥 שתף עם חבר", url: shareUrl },
+        ]] },
       });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
       return;
     }
 
@@ -1909,7 +1972,16 @@ async function handleUpdate(env, update) {
     await logEvent(env, chatId, "command", { cmd });
   }
 
-  if (cmd === "/start") await cmdStart(env, chatId, msg.from);
+  if (cmd === "/start") {
+    // Detect deep-link payloads like "/start follow_25441" — viral share flow.
+    const parts2 = text.split(/\s+/);
+    const arg = parts2[1];
+    if (arg && arg.startsWith("follow_")) {
+      await handleSharedFollow(env, chatId, msg.from, arg.slice("follow_".length));
+      return;
+    }
+    await cmdStart(env, chatId, msg.from);
+  }
   else if (cmd === "/reset") await cmdReset(env, chatId);
   else if (cmd === "/today") await cmdToday(env, chatId);
   else if (cmd === "/date") await cmdDate(env, chatId);
