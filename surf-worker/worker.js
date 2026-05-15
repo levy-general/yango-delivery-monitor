@@ -1687,7 +1687,17 @@ async function handleUpdate(env, update) {
         const prefs = await getUserPrefs(env, chatId);
         // Header that disambiguates this message when the user clicks several dates.
         const wantedDay = `${dayKey.slice(6, 8)}/${dayKey.slice(4, 6)}/${dayKey.slice(0, 4)}`;
-        const dateLine = `📅 <b>${wantedDay}</b>`;
+        // Day-of-week name for the picked date (Asia/Jerusalem).
+        const wd = new Intl.DateTimeFormat("he-IL", {
+          timeZone: "Asia/Jerusalem", weekday: "long",
+        }).format(new Date(
+          Number(dayKey.slice(0, 4)),
+          Number(dayKey.slice(4, 6)) - 1,
+          Number(dayKey.slice(6, 8)),
+          12, 0, 0
+        ));
+        // 🗓️ is a generic calendar glyph (no baked-in date number, unlike 📅).
+        const dateLine = `🗓️ <b>${wd}, ${wantedDay}</b>`;
         if (result.sessions && result.sessions.length) {
           await tg(env, "sendMessage", {
             chat_id: chatId,
