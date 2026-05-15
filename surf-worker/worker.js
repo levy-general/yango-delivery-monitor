@@ -1176,6 +1176,19 @@ function huntKeyboardForPrefs(prefs, dayKey = null) {
   ]] };
 }
 
+async function cmdShare(env, chatId) {
+  const botLink = "https://t.me/SurfParkBot";
+  const text = "🤙 מצאתי בוט מעולה שמודיע על סשנים פנויים בסרף פארק ת\"א לפי הרמה והשעות שלך. שווה:";
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(botLink)}&text=${encodeURIComponent(text)}`;
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "📣 אהבת? שתף עם חברים שגולשים — ככה כולם מקבלים התראות וגולשים יחד.",
+    reply_markup: { inline_keyboard: [[
+      { text: "👥 שתף את הבוט", url: shareUrl },
+    ]] },
+  });
+}
+
 async function cmdFeedback(env, chatId) {
   const prefs = (await getUserPrefs(env, chatId)) || {};
   prefs.pending = "feedback";
@@ -1269,6 +1282,7 @@ const CMDS_ACTIVE = [
   { command: "date", description: "בחירת סשן להרשמה" },
   { command: "alerts", description: "ההתראות שלי על סשנים מלאים" },
   { command: "feedback", description: "שליחת פידבק / באג / רעיון" },
+  { command: "share", description: "שיתוף הבוט עם חברים" },
   { command: "reset", description: "שינוי רמת גל וכיוון" },
   { command: "stop", description: "השהה התראות" },
 ];
@@ -1278,6 +1292,7 @@ const CMDS_PAUSED = [
   { command: "date", description: "בחירת סשן להרשמה" },
   { command: "alerts", description: "ההתראות שלי על סשנים מלאים" },
   { command: "feedback", description: "שליחת פידבק / באג / רעיון" },
+  { command: "share", description: "שיתוף הבוט עם חברים" },
   { command: "reset", description: "שינוי רמת גל וכיוון" },
 ];
 
@@ -2102,7 +2117,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/alerts", "/feedback"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/alerts", "/feedback", "/share"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -2128,6 +2143,7 @@ async function handleUpdate(env, update) {
   else if (cmd === "/resume") await cmdResume(env, chatId);
   else if (cmd === "/alerts") await cmdAlerts(env, chatId);
   else if (cmd === "/feedback") await cmdFeedback(env, chatId);
+  else if (cmd === "/share") await cmdShare(env, chatId);
 }
 
 // ---------- Worker entry ----------
