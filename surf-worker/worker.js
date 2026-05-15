@@ -1395,7 +1395,7 @@ async function cmdToday(env, chatId) {
   if (bookable.length) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "🤙 מה תופס לך?",
+      text: "🤙 איזה גל בא לך לתפוס?",
       reply_markup: await sessionsKeyboard(env, chatId, bookable, "https://surf-bot.shayko22.workers.dev", prefs),
     });
   } else {
@@ -1701,7 +1701,7 @@ async function handleUpdate(env, update) {
         if (result.sessions && result.sessions.length) {
           await tg(env, "sendMessage", {
             chat_id: chatId,
-            text: `${dateLine}\n🤙 איזה גל תופס לך?`,
+            text: `${dateLine}\n🤙 איזה גל בא לך לתפוס?`,
             parse_mode: "HTML",
             reply_markup: await sessionsKeyboard(env, chatId, result.sessions, origin, prefs),
           });
