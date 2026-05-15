@@ -270,6 +270,75 @@ async function markFeedbackAck(env, id) {
   await d1Run(env, "UPDATE feedback SET status='acknowledged', acknowledged_at=datetime('now') WHERE id=?", [id]);
 }
 
+// #1 — alert admin if the scraper hasn't pushed fresh data recently.
+async function checkScrapeHealth(env) {
+  const raw = await env.KV.get("last_scrape");
+  const now = Date.now();
+  let stale = false, info = "";
+  if (!raw) {
+    stale = true; info = "אין רישום סריקה כלל";
+  } else {
+    const { ts, count } = JSON.parse(raw);
+    const ageMin = Math.round((now - ts) / 60000);
+    if (ageMin > 60) { stale = true; info = `סריקה אחרונה לפני ${ageMin} דק'`; }
+    else if (count === 0) { stale = true; info = "הסריקה האחרונה החזירה 0 סשנים (SRF אולי שינו את האתר)"; }
+  }
+  if (!stale) return;
+  if (await env.KV.get("health_alerted")) return;  // already alerted, don't spam
+  await env.KV.put("health_alerted", "1", { expirationTtl: 21600 });  // re-arm after 6h
+  await tg(env, "sendMessage", {
+    chat_id: ADMIN_CHAT_ID,
+    text: `⚠️ <b>בעיית בריאות במערכת</b>\n${info}\n\nכדאי לבדוק את GitHub Actions / cron-job.org / מבנה ה-HTML של SRF.`,
+    parse_mode: "HTML",
+  });
+}
+
+// #5 — proactively nudge fully-onboarded subscribed users who got 0 alerts in
+// the last 7 days (their threshold/level filter is likely too narrow).
+async function maybeNudgeRestrictiveUsers(env) {
+  // Run at most once/day (guard by IL date).
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+  if ((await env.KV.get("nudge_day")) === today) return;
+  // Only run the sweep around 18:00 IL so messages arrive at a sane hour.
+  const hour = parseInt(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Jerusalem", hour: "2-digit", hour12: false,
+  }).format(new Date()), 10);
+  if (hour !== 18) return;
+  await env.KV.put("nudge_day", today, { expirationTtl: 172800 });
+
+  const users = await getUsers(env);
+  for (const id of users) {
+    const p = await getUserPrefs(env, id);
+    if (!p || !p.onboarded) continue;
+    const counts = await getAlertCounts(env, id);
+    if (counts.last7 > 0) continue;             // they're getting alerts — fine
+    if (p.last_nudge && (Date.now() - p.last_nudge) < 7 * 86400000) continue;  // nudged recently
+    p.last_nudge = Date.now();
+    await setUserPrefs(env, id, p);
+    await tg(env, "sendMessage", {
+      chat_id: id,
+      text:
+        "🌊 שבוע שלם בלי התראות —\n" +
+        `ההגדרות שלך (${levelsLabel(getLevels(p))} ${SIDE_HE[p.direction]}, סף ${p.spots_threshold}+) ` +
+        "אולי מצמצמות מדי.\n" +
+        "שלח /reset כדי להוריד את הסף או להוסיף רמות — ככה תקבל יותר הזדמנויות.",
+    });
+  }
+}
+
+// #8 — keep sessions_history bounded: drop rows older than 90 days, once/day.
+async function maybeCleanupHistory(env) {
+  if (!env.DB) return;
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+  if ((await env.KV.get("cleanup_day")) === today) return;
+  await env.KV.put("cleanup_day", today, { expirationTtl: 172800 });
+  await d1Run(env, "DELETE FROM sessions_history WHERE scraped_at < datetime('now','-90 days')");
+}
+
 async function fireDueHuntAlerts(env) {
   if (!env.DB) return 0;
   const sessions = await getSessions(env);
@@ -1850,6 +1919,66 @@ async function handleUpdate(env, update) {
       await renderUserList(env, chatId);
       return;
     }
+    if (parts[0] === "/report") {
+      const days = parts[1] && /^\d+$/.test(parts[1]) ? parseInt(parts[1], 10) : 7;
+      const since = `datetime('now','-${days} days')`;
+      const q = async (sql) => (await d1First(env, sql)) || {};
+
+      const searches = await q(
+        `SELECT COUNT(*) AS c, SUM(CASE WHEN is_available=0 THEN 1 ELSE 0 END) AS misses,
+                SUM(CASE WHEN is_available=0 AND matched_count>0 THEN 1 ELSE 0 END) AS full_misses
+         FROM search_logs WHERE search_timestamp >= ${since}`);
+      const topMiss = await d1Run(env,
+        `SELECT requested_levels, requested_direction, COUNT(*) AS n
+         FROM search_logs
+         WHERE is_available=0 AND search_timestamp >= ${since}
+         GROUP BY requested_levels, requested_direction
+         ORDER BY n DESC LIMIT 5`);
+      const alertsCnt = await q(
+        `SELECT COUNT(*) AS c FROM alerts_sent WHERE sent_at >= ${since}`);
+      const reg = await q(
+        `SELECT
+           SUM(CASE WHEN kind='followup' THEN 1 ELSE 0 END) AS surveys
+         FROM alerts_sent WHERE sent_at >= ${since}`);
+      // Conversion from event log (clicks + registration_report) across users.
+      const known = [...new Set([...(await getKnownUsers(env)), ...(await getWhitelist(env))])];
+      let clicks = 0, regYes = 0, regNo = 0;
+      const cutoff = Date.now() - days * 86400000;
+      for (const id of known) {
+        for (const e of await getEvents(env, id)) {
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          if (e.action === "click") clicks++;
+          if (e.action === "registration_report") (e.registered ? regYes++ : regNo++);
+        }
+      }
+      const conv = clicks ? Math.round((regYes / clicks) * 100) : 0;
+      const lines = [
+        `📊 <b>דוח ${days} ימים אחרונים</b>`,
+        ``,
+        `🔍 חיפושים: <b>${searches.c || 0}</b>`,
+        `❌ ללא מענה (Shadow Demand): <b>${searches.misses || 0}</b>`,
+        `   מתוכם "סשן קיים אך מלא": <b>${searches.full_misses || 0}</b>`,
+        ``,
+        `🔝 <b>הביקוש הכי לא-מסופק:</b>`,
+      ];
+      for (const r of (topMiss.results || [])) {
+        let lv = r.requested_levels;
+        try { lv = JSON.parse(lv).map((x) => "L" + x).join("+"); } catch {}
+        const sd = r.requested_direction === "left" ? "שמאל" : r.requested_direction === "right" ? "ימין" : (r.requested_direction || "");
+        lines.push(`   ${lv || "?"} ${sd} — ${r.n} פעמים`);
+      }
+      lines.push(
+        ``,
+        `📨 התראות שנשלחו: <b>${alertsCnt.c || 0}</b>`,
+        `🔗 קליקים לאתר: <b>${clicks}</b>`,
+        `✅ אישרו הרשמה: <b>${regYes}</b> · ❌ לא: <b>${regNo}</b>`,
+        `📈 <b>שיעור המרה: ${conv}%</b> (קליק → הרשמה מאומתת)`,
+      );
+      await tg(env, "sendMessage", {
+        chat_id: chatId, text: lines.join("\n"), parse_mode: "HTML",
+      });
+      return;
+    }
     if (parts[0] === "/events") {
       const target = parts[1] ? parseInt(parts[1], 10) : NaN;
       if (!Number.isFinite(target)) {
@@ -2004,10 +2133,13 @@ async function handleUpdate(env, update) {
 // ---------- Worker entry ----------
 export default {
   async scheduled(event, env, ctx) {
-    // Cron trigger every 5 min — follow-up surveys + hunt-alert dispatch.
+    // Cron trigger every 5 min.
     ctx.waitUntil(Promise.all([
       processDueFollowups(env),
       fireDueHuntAlerts(env),
+      checkScrapeHealth(env),
+      maybeNudgeRestrictiveUsers(env),
+      maybeCleanupHistory(env),
     ]));
   },
 
@@ -2145,12 +2277,18 @@ export default {
       }
       const body = await request.text();
       await env.KV.put("sessions", body);
+      let count = 0;
       try {
         const arr = JSON.parse(body);
+        count = arr.length;
         await pushSessionsHistoryD1(env, arr);
       } catch (e) {
         console.error("sessions_history insert:", e);
       }
+      // Health heartbeat: record last successful scrape + session count.
+      await env.KV.put("last_scrape", JSON.stringify({ ts: Date.now(), count }));
+      // Clear any prior staleness-alert flag so a fresh outage re-alerts.
+      await env.KV.delete("health_alerted");
       return new Response("ok");
     }
 

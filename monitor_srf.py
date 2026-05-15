@@ -373,11 +373,23 @@ def in_quiet_hours() -> bool:
 def main():
     state = load_state()
 
+    ADMIN_CHAT_ID = 328859712
     try:
         sessions = fetch_all_windows(days_ahead=9)
     except Exception as e:
         print(f"scrape failed: {e}", file=sys.stderr)
+        try:
+            telegram_send(ADMIN_CHAT_ID,
+                          f"⚠️ <b>סריקת SRF נכשלה</b>\n<code>{str(e)[:300]}</code>")
+        except Exception:
+            pass
         return
+    if not sessions:
+        try:
+            telegram_send(ADMIN_CHAT_ID,
+                          "⚠️ <b>סריקת SRF החזירה 0 סשנים</b> — ייתכן שינוי במבנה האתר.")
+        except Exception:
+            pass
     print(f"Parsed {len(sessions)} sessions across windows.")
 
     push_sessions(sessions)
