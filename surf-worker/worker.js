@@ -18,6 +18,8 @@ const SIDE_HE = { right: "ימין", left: "שמאל", both: "ימין+שמאל"
 const WAVE_LEVELS = [1, 2, 3, 4, 5, 6];
 const ADMIN_CHAT_ID = 328859712;  // Shay — sole admin; can approve new users.
 const SRF_URL = "https://www.srfparktlv.co.il/sessions/?show-children=false&show-adults=false&zone=reef-left";
+// The worker's public origin. Rename the Cloudflare Worker → update this once.
+const WORKER_ORIGIN = "https://surf-bot.shayko22.workers.dev";
 
 // Title rewrites — for sessions with overlong/uninformative names from SRF.
 // Match is exact (case-insensitive) on the original title from the site.
@@ -378,7 +380,7 @@ async function fireDueHuntAlerts(env) {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
       day: "2-digit", month: "2-digit",
     }).format(new Date(match.start));
-    const url = `https://surf-bot.shayko22.workers.dev/r/${a.telegram_id}/${match.id}?lead=hunt`;
+    const url = `${WORKER_ORIGIN}/r/${a.telegram_id}/${match.id}?lead=hunt`;
     try {
       await tg(env, "sendMessage", {
         chat_id: a.telegram_id,
@@ -645,11 +647,43 @@ async function userStatus(env, id) {
 }
 
 function contactButton(id, p) {
-  // Prefer username deep-link (works everywhere); fall back to user-id link.
-  const url = p && p.username
-    ? `https://t.me/${p.username}`
-    : `tg://user?id=${id}`;
-  return { text: "💬 פנה למשתמש", url };
+  // Sends an official message AS the bot (Kai) to the user — not a personal
+  // DM from the admin's own Telegram account.
+  return { text: "💬 פנה למשתמש", callback_data: `contactuser:${id}` };
+}
+
+// Delivers an admin message to a user as "הודעה מקאי" and reports back to the
+// admin. Returns true on success.
+async function sendAsKai(env, target, rawText) {
+  const safe = rawText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  try {
+    await tg(env, "sendMessage", {
+      chat_id: target,
+      text: `✉️ <b>הודעה מקאי סרף</b>\n\n${safe}`,
+      parse_mode: "HTML",
+    });
+    await logEvent(env, target, "admin_message", { text: rawText });
+    const tp = (await getUserPrefs(env, target)) || {};
+    tp.reply_to_admin = true;
+    await setUserPrefs(env, target, tp);
+    const who =
+      tp.full_name ||
+      [tp.tg_first_name, tp.tg_last_name].filter(Boolean).join(" ") ||
+      (tp.username ? `@${tp.username}` : `chat ${target}`);
+    await tg(env, "sendMessage", {
+      chat_id: ADMIN_CHAT_ID,
+      text: `✅ נשלח ל-<b>${who}</b> <code>${target}</code> בשם קאי.`,
+      parse_mode: "HTML",
+    });
+    return true;
+  } catch (e) {
+    await tg(env, "sendMessage", {
+      chat_id: ADMIN_CHAT_ID,
+      text: `❌ לא הצלחתי לשלוח למשתמש <code>${target}</code> (ייתכן שחסם את הבוט).`,
+      parse_mode: "HTML",
+    });
+    return false;
+  }
 }
 
 function userActionKeyboard(id, status, p) {
@@ -777,7 +811,7 @@ async function notifyAdminNewUser(env, msg) {
     parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [[
-        { text: "💬 פנה למשתמש", url: from.username ? `https://t.me/${from.username}` : `tg://user?id=${msg.chat.id}` },
+        { text: "💬 פנה למשתמש", callback_data: `contactuser:${msg.chat.id}` },
         { text: "🚪 הסרה", callback_data: `udelete:${msg.chat.id}` },
       ]],
     },
@@ -868,7 +902,7 @@ async function startOnboarding(env, chatId, existingPrefs = null) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
-      "👋 ברוך הבא ל-<b>Surf Park Alerts</b>!\n\n" +
+      "👋 היי, אני <b>קאי</b>!\n\n" +
       "אני שולח התראות לפני סשנים בסרף פארק תל אביב כשנשארו מקומות פנויים.\n\n" +
       "<b>שלב 1/5:</b> מה השם המלא שלך?",
     parse_mode: "HTML",
@@ -1064,7 +1098,7 @@ async function handleSharedFollow(env, chatId, from, sessionId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
-      `👋 ברוך הבא ל-<b>Surf Park Alerts</b>\n\n` +
+      `👋 היי, אני <b>קאי</b>\n\n` +
       `חבר שיתף איתך סשן:\n` +
       `🌊 <b>${time} · L${s.level} ${side}</b>\n` +
       `${displayTitle(s.title)} · נותרו ${s.spots} מקומות\n\n` +
@@ -1224,7 +1258,7 @@ async function handleFeedbackInput(env, chatId, prefs, text) {
       `${text}`,
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: [[
-      { text: "💬 פנה למשתמש", url: prefs.username ? `https://t.me/${prefs.username}` : `tg://user?id=${chatId}` },
+      { text: "💬 פנה למשתמש", callback_data: `contactuser:${chatId}` },
     ]] },
   });
 }
@@ -1408,9 +1442,13 @@ async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {})
     const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
     const cleanTitle = displayTitle(s.title);
     const sidePart = showSide ? ` ${side}` : "";
-    const registerUrl = `${workerOrigin}/r/${s.id}?u=${token}&lead=manual`;
+    const appUrl =
+      `${workerOrigin}/app?s=${encodeURIComponent(s.id)}&u=${token}` +
+      `&t=${encodeURIComponent(time)}&lv=${s.level}` +
+      `&sd=${encodeURIComponent(side)}&ti=${encodeURIComponent(cleanTitle)}` +
+      `&sp=${s.spots}`;
     const registerLabel = `📝 ${time}${sidePart} · ${cleanTitle} · ${boldNum(s.spots)} פנוי`;
-    rows.push([{ text: registerLabel, url: registerUrl }]);
+    rows.push([{ text: registerLabel, web_app: { url: appUrl } }]);
     rows.push([{ text: `🔔 עקוב אחרי ${time}`, callback_data: `huntsess:${s.id}` }]);
   }
   return { inline_keyboard: rows };
@@ -1480,7 +1518,7 @@ async function cmdToday(env, chatId) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "🤙 איזה גל בא לך לתפוס?",
-      reply_markup: await sessionsKeyboard(env, chatId, bookable, "https://surf-bot.shayko22.workers.dev", prefs),
+      reply_markup: await sessionsKeyboard(env, chatId, bookable, WORKER_ORIGIN, prefs),
     });
   } else {
     await tg(env, "sendMessage", {
@@ -1612,6 +1650,28 @@ async function handleUpdate(env, update) {
         text: answer === "yes"
           ? "🙌 מעולה — תודה על העדכון! נמשיך לשלוח לך התראות."
           : "תודה על העדכון. אם משהו לא טוב — /reset לעדכן הגדרות.",
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+      return;
+    }
+
+    // Admin → official outreach to a user, sent AS the bot (Kai).
+    if (data.startsWith("contactuser:")) {
+      if (chatId !== ADMIN_CHAT_ID) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "אין הרשאה" });
+        return;
+      }
+      const target = parseInt(data.split(":")[1], 10);
+      const ap = (await getUserPrefs(env, ADMIN_CHAT_ID)) || {};
+      ap.pending = `contact:${target}`;
+      await setUserPrefs(env, ADMIN_CHAT_ID, ap);
+      await tg(env, "sendMessage", {
+        chat_id: ADMIN_CHAT_ID,
+        text:
+          `✍️ כתוב את ההודעה שתישלח למשתמש <code>${target}</code> בשם <b>קאי</b>.\n` +
+          `המשתמש יראה אותה כפנייה רשמית מהבוט.\n` +
+          `(לביטול: /start)`,
+        parse_mode: "HTML",
       });
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
       return;
@@ -1760,7 +1820,7 @@ async function handleUpdate(env, update) {
       const dayKey = data.slice(5);
       const result = await showSessionsForDate(env, chatId, dayKey);
       if (result) {
-        const origin = new URL(cb.message.chat ? "https://surf-bot.shayko22.workers.dev" : "https://surf-bot.shayko22.workers.dev").origin;
+        const origin = WORKER_ORIGIN;
         await tg(env, "editMessageText", {
           chat_id: chatId,
           message_id: msgId,
@@ -1880,7 +1940,7 @@ async function handleUpdate(env, update) {
               `<code>${chatId}</code>`,
             parse_mode: "HTML",
             reply_markup: { inline_keyboard: [[
-              { text: "💬 פנה למשתמש", url: prefs.username ? `https://t.me/${prefs.username}` : `tg://user?id=${chatId}` },
+              { text: "💬 פנה למשתמש", callback_data: `contactuser:${chatId}` },
               { text: "🚪 הסרה", callback_data: `udelete:${chatId}` },
             ]] },
           });
@@ -2041,7 +2101,7 @@ async function handleUpdate(env, update) {
         if (totals[id]) lines.push(`<code>${id}</code>: ${totals[id]} אירועים`);
       }
       const key = env.PUSH_SECRET ? encodeURIComponent(env.PUSH_SECRET) : "";
-      lines.push("", `הורדה מלאה: https://surf-bot.shayko22.workers.dev/events?key=${key}`);
+      lines.push("", `הורדה מלאה: ${WORKER_ORIGIN}/events?key=${key}`);
       await tg(env, "sendMessage", {
         chat_id: chatId,
         text: lines.join("\n"),
@@ -2096,6 +2156,32 @@ async function handleUpdate(env, update) {
 
   // Mid-onboarding handlers — accept free-text input depending on stage.
   const prefs = (await getUserPrefs(env, chatId)) || {};
+  // Admin replies (Telegram swipe-reply) to a relayed user message → send to
+  // that exact user. Lets the admin juggle many users without state mixups.
+  if (
+    chatId === ADMIN_CHAT_ID &&
+    msg.reply_to_message &&
+    text && !text.startsWith("/")
+  ) {
+    const quoted = msg.reply_to_message.text || msg.reply_to_message.caption || "";
+    const m = quoted.match(/\b(\d{6,})\b/);
+    if (m) {
+      await sendAsKai(env, parseInt(m[1], 10), text);
+      return;
+    }
+  }
+  if (
+    chatId === ADMIN_CHAT_ID &&
+    typeof prefs.pending === "string" &&
+    prefs.pending.startsWith("contact:") &&
+    text && !text.startsWith("/")
+  ) {
+    const target = parseInt(prefs.pending.split(":")[1], 10);
+    prefs.pending = null;
+    await setUserPrefs(env, ADMIN_CHAT_ID, prefs);
+    await sendAsKai(env, target, text);
+    return;
+  }
   if (prefs.pending === "feedback" && text && !text.startsWith("/")) {
     await handleFeedbackInput(env, chatId, prefs, text);
     return;
@@ -2114,6 +2200,32 @@ async function handleUpdate(env, update) {
       await handleAddressInput(env, chatId, prefs, text, null);
       return;
     }
+  }
+
+  // User replying after the admin contacted them → relay back to the admin.
+  if (
+    chatId !== ADMIN_CHAT_ID &&
+    prefs.reply_to_admin &&
+    !prefs.pending &&
+    text && !text.startsWith("/")
+  ) {
+    const who =
+      prefs.full_name ||
+      [prefs.tg_first_name, prefs.tg_last_name].filter(Boolean).join(" ") ||
+      (prefs.username ? `@${prefs.username}` : `chat ${chatId}`);
+    const safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    await tg(env, "sendMessage", {
+      chat_id: ADMIN_CHAT_ID,
+      text:
+        `💬 <b>תשובה מ-${who}</b> <code>${chatId}</code>\n\n${safe}\n\n` +
+        `<i>↩️ השב להודעה הזו כדי לענות לו ישירות</i>`,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[
+        { text: "💬 השב למשתמש", callback_data: `contactuser:${chatId}` },
+      ]] },
+    });
+    await logEvent(env, chatId, "user_reply", { text });
+    return;
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
@@ -2216,6 +2328,11 @@ export default {
         fromDateParam = `&from_date=${encodeURIComponent(dd)}`;
       }
       const target = `https://www.srfparktlv.co.il/sessions/?sid=${encodeURIComponent(sessionId)}${fromDateParam}&show-children=false&show-adults=false&zone=reef-right%7Creef-left`;
+      // Mini App calls with ?json=1 — it logs the click via this same path but
+      // opens SRF directly, so the user's browser never shows the worker URL.
+      if (url.searchParams.get("json") === "1") {
+        return Response.json({ target });
+      }
       return Response.redirect(target, 302);
     }
 
@@ -2316,6 +2433,105 @@ export default {
         userCount: users.length,
         users,
         firstSession: sessions[0] || null,
+      });
+    }
+
+    if (url.pathname === "/setup") {
+      // One-time: sets the bot's display name (the chat title shown in Telegram).
+      const r1 = await tg(env, "setMyName", { name: "Kai" });
+      const r2 = await tg(env, "setMyShortDescription", {
+        short_description: "קאי — התראות על סשנים פנויים בסרף פארק ת\"א",
+      });
+      const r3 = await tg(env, "setMyDescription", {
+        description: "היי, אני קאי 🤙 שולח לך התראה לפני סשנים בסרף פארק תל אביב כשנשארו מקומות פנויים, לפי הרמה והשעות שלך.",
+      });
+      return Response.json({ setMyName: r1, setMyShortDescription: r2, setMyDescription: r3 });
+    }
+
+    if (url.pathname === "/app") {
+      const q = url.searchParams;
+      const sid = q.get("s") || "";
+      const tok = q.get("u") || "";
+      const esc = (v) =>
+        String(v || "").replace(/[&<>"']/g, (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+        );
+      const t = esc(q.get("t"));
+      const lv = esc(q.get("lv"));
+      const sd = esc(q.get("sd"));
+      const ti = esc(q.get("ti")) || "סשן";
+      const sp = esc(q.get("sp"));
+      const regUrl = `${url.origin}/r/${encodeURIComponent(sid)}?u=${encodeURIComponent(tok)}&lead=manual`;
+      const html = `<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>הרשמה לסשן</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--tg-theme-bg-color, #fff);
+    color: var(--tg-theme-text-color, #000);
+    padding: 20px; min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  .card {
+    background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+    border-radius: 16px; padding: 20px; margin-bottom: 16px;
+  }
+  .title { font-size: 20px; font-weight: 700; margin: 0 0 14px; }
+  .row { display: flex; justify-content: space-between; padding: 8px 0;
+         border-bottom: 1px solid rgba(128,128,128,.18); font-size: 16px; }
+  .row:last-child { border-bottom: 0; }
+  .label { color: var(--tg-theme-hint-color, #888); }
+  .val { font-weight: 600; }
+  .spots { color: #1e9e4a; font-weight: 700; }
+  .note { font-size: 13px; color: var(--tg-theme-hint-color, #888);
+          text-align: center; margin-top: auto; padding-top: 16px; }
+  button {
+    width: 100%; padding: 15px; font-size: 17px; font-weight: 700;
+    border: 0; border-radius: 14px; cursor: pointer;
+    background: var(--tg-theme-button-color, #2ea6ff);
+    color: var(--tg-theme-button-text-color, #fff);
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1 class="title">🌊 ${ti}</h1>
+    <div class="row"><span class="label">שעה</span><span class="val">${t || "—"}</span></div>
+    <div class="row"><span class="label">רמה</span><span class="val">L${lv || "—"} ${sd || ""}</span></div>
+    <div class="row"><span class="label">מקומות פנויים</span><span class="spots">${sp || "—"}</span></div>
+  </div>
+  <button id="reg">📝 המשך להרשמה באתר סרף פארק</button>
+  <div class="note">קאי ישלח לך תזכורת אחרי הסשן לוודא שנרשמת 🤙</div>
+<script>
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  document.getElementById("reg").addEventListener("click", function () {
+    var btn = document.getElementById("reg");
+    btn.disabled = true; btn.textContent = "פותח את אתר ההרשמה…";
+    var u = ${JSON.stringify(regUrl)};
+    fetch(u + "&json=1")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var dest = (d && d.target) || u;
+        if (tg && tg.openLink) { tg.openLink(dest); } else { window.open(dest, "_blank"); }
+        if (tg && tg.close) { setTimeout(function () { tg.close(); }, 300); }
+      })
+      .catch(function () {
+        if (tg && tg.openLink) { tg.openLink(u); } else { window.open(u, "_blank"); }
+      });
+  });
+</script>
+</body>
+</html>`;
+      return new Response(html, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
 
