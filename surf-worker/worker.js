@@ -53,6 +53,13 @@ function displayTitle(raw) {
     .trim();
 }
 
+// Wave-type code from a title, e.g. "L6 Pro (T2+B2)" → "T2+B2".
+function waveCode(raw) {
+  const t = displayTitle(raw);
+  const m = t.match(/\(([^)]+)\)\s*$/);
+  return m ? m[1].trim() : t;
+}
+
 // ---------- Telegram ----------
 async function tg(env, method, payload) {
   const res = await fetch(
@@ -1314,7 +1321,6 @@ async function cmdAlerts(env, chatId) {
 const CMDS_ACTIVE = [
   { command: "today", description: "סשנים שלי היום" },
   { command: "date", description: "בחירת סשן להרשמה" },
-  { command: "alerts", description: "ההתראות שלי על סשנים מלאים" },
   { command: "feedback", description: "שליחת פידבק / באג / רעיון" },
   { command: "share", description: "שיתוף הבוט עם חברים" },
   { command: "reset", description: "שינוי רמת גל וכיוון" },
@@ -1324,7 +1330,6 @@ const CMDS_PAUSED = [
   { command: "resume", description: "חידוש התראות" },
   { command: "today", description: "סשנים שלי היום" },
   { command: "date", description: "בחירת סשן להרשמה" },
-  { command: "alerts", description: "ההתראות שלי על סשנים מלאים" },
   { command: "feedback", description: "שליחת פידבק / באג / רעיון" },
   { command: "share", description: "שיתוף הבוט עם חברים" },
   { command: "reset", description: "שינוי רמת גל וכיוון" },
@@ -1426,12 +1431,8 @@ async function showSessionsForDate(env, chatId, dayKey) {
 
 // One inline-keyboard button per session — opens the tracked registration link.
 async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {}) {
-  // Each session = 2 stacked rows for full readability:
-  //   row 1: full-width register button (whole title visible)
-  //   row 2: full-width 🔔 follow button (with the session time so it's clear
-  //          which session the bell refers to)
+  // Each session = one full-width register button. Follow is inside the Mini App.
   const token = await ensureClickToken(env, chatId);
-  const showSide = (prefs.direction === "both");
   const limited = sessions.slice(0, 25);
 
   const rows = [];
@@ -1439,17 +1440,15 @@ async function sessionsKeyboard(env, chatId, sessions, workerOrigin, prefs = {})
     const time = new Intl.DateTimeFormat("he-IL", {
       timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit",
     }).format(new Date(s.start));
-    const side = s.area.toLowerCase().includes("left") ? "שמאל" : "ימין";
-    const cleanTitle = displayTitle(s.title);
-    const sidePart = showSide ? ` ${side}` : "";
-    const appUrl =
-      `${workerOrigin}/app?s=${encodeURIComponent(s.id)}&u=${token}` +
-      `&t=${encodeURIComponent(time)}&lv=${s.level}` +
-      `&sd=${encodeURIComponent(side)}&ti=${encodeURIComponent(cleanTitle)}` +
-      `&sp=${s.spots}`;
-    const registerLabel = `📝 ${time}${sidePart} · ${cleanTitle} · ${boldNum(s.spots)} פנוי`;
-    rows.push([{ text: registerLabel, web_app: { url: appUrl } }]);
-    rows.push([{ text: `🔔 עקוב אחרי ${time}`, callback_data: `huntsess:${s.id}` }]);
+    const isLeft = s.area.toLowerCase().includes("left");
+    const lvlCode = `${isLeft ? "L" : "R"}${s.level}`;
+    // Plain Telegram link → /r/ → 302 to the SRF deep-link (sid+from_date).
+    // `k` is a stable key (start.level.side); /r/ resolves it to the freshest
+    // SRF id from KV at click-time, since SRF rotates session ids over time.
+    const sKey = `${s.start}.${s.level}.${isLeft ? "L" : "R"}`;
+    const registerUrl = `${workerOrigin}/r/${s.id}?u=${token}&lead=manual&k=${encodeURIComponent(sKey)}`;
+    const registerLabel = `📝 ${time} · ${lvlCode} · ${waveCode(s.title)} · פנוי ${boldNum(s.spots)}`;
+    rows.push([{ text: registerLabel, url: registerUrl }]);
   }
   return { inline_keyboard: rows };
 }
@@ -1505,28 +1504,32 @@ async function cmdToday(env, chatId) {
   await logEvent(env, chatId, "result", { cmd: "/today", matched: matching.length, available: bookable.length });
   await logSearchD1(env, chatId, "/today", getLevels(prefs), prefs.direction, null, matching.length, bookable.length);
   const header = `📋 <b>סטטוס היום (${levelsLabel(getLevels(prefs))} ${SIDE_HE[prefs.direction]})</b>\n`;
-  const body = bookable.length
-    ? bookable.map((s) => fmtSession(s)).join("\n")
-    : "אין סשנים זמינים להזמנה היום.";
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: header + body,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
-  if (bookable.length) {
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: "🤙 איזה גל בא לך לתפוס?",
-      reply_markup: await sessionsKeyboard(env, chatId, bookable, WORKER_ORIGIN, prefs),
-    });
-  } else {
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: "🌊 הים לא מחכה — תתן לי לנפנף לך כשיתפנה מקום?",
-      reply_markup: huntKeyboardForPrefs(prefs, null),
-    });
+  const payload = bookable.length
+    ? {
+        text: header + "🤙 איזה גל בא לך לתפוס?",
+        reply_markup: await sessionsKeyboard(env, chatId, bookable, WORKER_ORIGIN, prefs),
+      }
+    : {
+        text: header + "אין סשנים זמינים להזמנה היום.\n🌊 הים לא מחכה — תתן לי לנפנף לך כשיתפנה מקום?",
+        reply_markup: huntKeyboardForPrefs(prefs, null),
+      };
+  // Repeated /today: drop the previous (now-stale) message instead of stacking
+  // duplicates, then send a fresh one at the bottom of the chat.
+  if (prefs.today_msg_id) {
+    try {
+      await tg(env, "deleteMessage", { chat_id: chatId, message_id: prefs.today_msg_id });
+    } catch (e) {}
   }
+  const sent = await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: payload.text,
+    parse_mode: "HTML",
+    reply_markup: payload.reply_markup,
+  });
+  const mid = sent && sent.result && sent.result.message_id;
+  const fresh = (await getUserPrefs(env, chatId)) || {};
+  fresh.today_msg_id = mid || null;
+  await setUserPrefs(env, chatId, fresh);
 }
 
 async function cmdAll(env, chatId) {
@@ -1623,7 +1626,7 @@ async function handleUpdate(env, update) {
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: "נרשם!" });
       await tg(env, "sendMessage", {
         chat_id: chatId,
-        text: "🔔 ההתראה נרשמה. ברגע שיתפנה מקום מתאים — אעדכן.\nראה את כל ההתראות שלך ב-/alerts.",
+        text: "🔔 ההתראה נרשמה. ברגע שיתפנה מקום מתאים — אעדכן.",
       });
       return;
     }
@@ -2229,7 +2232,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/alerts", "/feedback", "/share"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/feedback", "/share"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -2253,7 +2256,6 @@ async function handleUpdate(env, update) {
   else if (cmd === "/date") await cmdDate(env, chatId);
   else if (cmd === "/stop") await cmdStop(env, chatId);
   else if (cmd === "/resume") await cmdResume(env, chatId);
-  else if (cmd === "/alerts") await cmdAlerts(env, chatId);
   else if (cmd === "/feedback") await cmdFeedback(env, chatId);
   else if (cmd === "/share") await cmdShare(env, chatId);
 }
@@ -2307,6 +2309,18 @@ export default {
     if (sessionId) {
       const lead = url.searchParams.get("lead") || "";
       const sessions = await getSessions(env);
+      // Resolve the stable key (start.level.side) to the freshest SRF id in KV
+      // — SRF rotates session ids, so the id baked in the button may be stale.
+      const k = url.searchParams.get("k");
+      if (k) {
+        const [kStart, kLevel, kSide] = k.split(".");
+        const fresh = sessions.find((x) =>
+          String(x.start) === kStart &&
+          String(x.level) === kLevel &&
+          (x.area.toLowerCase().includes("left") ? "L" : "R") === kSide
+        );
+        if (fresh) sessionId = fresh.id;
+      }
       const s = sessions.find((x) => x.id === sessionId);
       const detail = s
         ? { session_id: sessionId, session_start: s.start, session_spots_at_click: s.spots, level: s.level, area: s.area, lead }
@@ -2445,7 +2459,22 @@ export default {
       const r3 = await tg(env, "setMyDescription", {
         description: "היי, אני קאי 🤙 שולח לך התראה לפני סשנים בסרף פארק תל אביב כשנשארו מקומות פנויים, לפי הרמה והשעות שלך.",
       });
-      return Response.json({ setMyName: r1, setMyShortDescription: r2, setMyDescription: r3 });
+      // Remove the Mini App "OPEN" launcher — reset menu button to commands.
+      const r4 = await tg(env, "setChatMenuButton", { menu_button: { type: "commands" } });
+      return Response.json({ setMyName: r1, setMyShortDescription: r2, setMyDescription: r3, setChatMenuButton: r4 });
+    }
+
+    if (url.pathname === "/follow") {
+      const sid = url.searchParams.get("s") || "";
+      const tok = url.searchParams.get("u") || "";
+      const cid = tok ? await chatIdFromToken(env, tok) : null;
+      if (!sid || !cid) return Response.json({ ok: false }, { status: 400 });
+      const existing = await d1First(env,
+        `SELECT a.id FROM alerts a JOIN users u ON a.user_id = u.id
+         WHERE u.telegram_id = ? AND a.session_id = ? AND a.is_active = 1`,
+        [cid, sid]);
+      if (!existing) await addHuntAlert(env, cid, null, null, null, null, sid);
+      return Response.json({ ok: true });
     }
 
     if (url.pathname === "/app") {
@@ -2462,6 +2491,7 @@ export default {
       const ti = esc(q.get("ti")) || "סשן";
       const sp = esc(q.get("sp"));
       const regUrl = `${url.origin}/r/${encodeURIComponent(sid)}?u=${encodeURIComponent(tok)}&lead=manual`;
+      const followUrl = `${url.origin}/follow?s=${encodeURIComponent(sid)}&u=${encodeURIComponent(tok)}`;
       const html = `<!doctype html>
 <html lang="he" dir="rtl">
 <head>
@@ -2494,10 +2524,16 @@ export default {
           text-align: center; margin-top: auto; padding-top: 16px; }
   button {
     width: 100%; padding: 15px; font-size: 17px; font-weight: 700;
-    border: 0; border-radius: 14px; cursor: pointer;
+    border: 0; border-radius: 14px; cursor: pointer; margin-bottom: 10px;
     background: var(--tg-theme-button-color, #2ea6ff);
     color: var(--tg-theme-button-text-color, #fff);
   }
+  button.secondary {
+    background: transparent;
+    color: var(--tg-theme-button-color, #2ea6ff);
+    box-shadow: inset 0 0 0 1.5px var(--tg-theme-button-color, #2ea6ff);
+  }
+  button:disabled { opacity: .6; cursor: default; }
 </style>
 </head>
 <body>
@@ -2508,6 +2544,7 @@ export default {
     <div class="row"><span class="label">מקומות פנויים</span><span class="spots">${sp || "—"}</span></div>
   </div>
   <button id="reg">📝 המשך להרשמה באתר סרף פארק</button>
+  <button id="flw" class="secondary">🔔 עקוב אחרי הסשן</button>
   <div class="note">קאי ישלח לך תזכורת אחרי הסשן לוודא שנרשמת 🤙</div>
 <script>
   var tg = window.Telegram && window.Telegram.WebApp;
@@ -2515,17 +2552,22 @@ export default {
   document.getElementById("reg").addEventListener("click", function () {
     var btn = document.getElementById("reg");
     btn.disabled = true; btn.textContent = "פותח את אתר ההרשמה…";
+    // Open the /r/ link directly — it logs the click and 302-redirects to the
+    // SRF deep-link, the proven flow that auto-opens the booking modal.
     var u = ${JSON.stringify(regUrl)};
-    fetch(u + "&json=1")
+    if (tg && tg.openLink) { tg.openLink(u); } else { window.open(u, "_blank"); }
+    if (tg && tg.close) { setTimeout(function () { tg.close(); }, 400); }
+  });
+  document.getElementById("flw").addEventListener("click", function () {
+    var b = document.getElementById("flw");
+    b.disabled = true; b.textContent = "רושם מעקב…";
+    fetch(${JSON.stringify(followUrl)})
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        var dest = (d && d.target) || u;
-        if (tg && tg.openLink) { tg.openLink(dest); } else { window.open(dest, "_blank"); }
-        if (tg && tg.close) { setTimeout(function () { tg.close(); }, 300); }
+        b.textContent = (d && d.ok) ? "✅ עוקב — קאי יעדכן כשמתפנה מקום" : "❌ לא הצלחתי, נסה שוב";
+        if (d && d.ok && tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
       })
-      .catch(function () {
-        if (tg && tg.openLink) { tg.openLink(u); } else { window.open(u, "_blank"); }
-      });
+      .catch(function () { b.textContent = "❌ לא הצלחתי, נסה שוב"; b.disabled = false; });
   });
 </script>
 </body>
