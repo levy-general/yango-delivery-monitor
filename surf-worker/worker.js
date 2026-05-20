@@ -512,10 +512,15 @@ async function processDueFollowups(env) {
           `🏄 רגע אחרון —\n` +
           `הצלחת להירשם ל<b>${title}</b> בשעה <b>${when}</b>?`,
         parse_mode: "HTML",
-        reply_markup: { inline_keyboard: [[
-          { text: "✅ כן, נרשמתי", callback_data: `reg:yes:${f.session_id}` },
-          { text: "❌ לא", callback_data: `reg:no:${f.session_id}` },
-        ]] },
+        reply_markup: { inline_keyboard: [
+          [
+            { text: "✅ נרשמתי", callback_data: `reg:yes:${f.session_id}` },
+            { text: "❌ לא נרשמתי", callback_data: `reg:no:${f.session_id}` },
+          ],
+          [
+            { text: "🤷 לא רלוונטי", callback_data: `reg:na:${f.session_id}` },
+          ],
+        ] },
       });
       await logAlertSent(env, f.chat_id, "followup", f.session_id);
       sent++;
@@ -1646,13 +1651,16 @@ async function handleUpdate(env, update) {
     // Registration self-report from the follow-up survey.
     if (data.startsWith("reg:")) {
       const [, answer, sessionId] = data.split(":");
-      await logEvent(env, chatId, "registration_report", { session_id: sessionId, registered: answer === "yes" });
+      await logEvent(env, chatId, "registration_report", { session_id: sessionId, registered: answer === "yes", answer });
+      const replies = {
+        yes: "🙌 מעולה — תודה על העדכון! נמשיך לשלוח לך התראות.",
+        no:  "תודה על העדכון. אם משהו לא טוב — /reset לעדכן הגדרות.",
+        na:  "👍 קיבלתי — הסשן הזה לא רלוונטי. נמשיך לשלוח התראות לפי ההעדפות שלך.",
+      };
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: msgId,
-        text: answer === "yes"
-          ? "🙌 מעולה — תודה על העדכון! נמשיך לשלוח לך התראות."
-          : "תודה על העדכון. אם משהו לא טוב — /reset לעדכן הגדרות.",
+        text: replies[answer] || replies.no,
       });
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
       return;
@@ -1827,7 +1835,7 @@ async function handleUpdate(env, update) {
         await tg(env, "editMessageText", {
           chat_id: chatId,
           message_id: msgId,
-          text: result.header + result.body,
+          text: result.header,
           parse_mode: "HTML",
           reply_markup: await dateKeyboard(env),
         });
