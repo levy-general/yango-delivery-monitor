@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from travel import driving_eta, SURF_PARK_COORDS
+from travel import SURF_PARK_COORDS
 
 TZ = ZoneInfo("Asia/Jerusalem")
 
@@ -280,20 +280,17 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
                 continue
 
             mins_to = int(time_until.total_seconds() / 60)
-            travel_line = ""
-            if lead <= 90 and prefs.get("lat") and prefs.get("lon"):
-                eta = driving_eta((prefs["lat"], prefs["lon"]), SURF_PARK_COORDS)
-                if eta:
-                    travel_line = f"זמן נסיעה: {eta}\n"
-
             register_url = f"{WORKER_URL}/r/{chat_id}/{s['id']}?lead={lead}"
+            # Waze deep-link → opens the app (or web) with live-traffic navigation
+            # to Surf Park. Far more accurate than any server-side ETA estimate.
+            waze_url = f"https://waze.com/ul?ll={SURF_PARK_COORDS[0]},{SURF_PARK_COORDS[1]}&navigate=yes"
             msg = (
                 f"🏄 <b>Surf Park</b>\n"
                 f"שם הסשן: {s['title']}\n"
                 f"שעה: {s['start'].strftime('%H:%M')} ({s['start'].strftime('%d/%m')}) — בעוד ~{mins_to} דק'\n"
-                f"מקומות פנויים: {s['spots']}\n"
-                f"{travel_line}"
-                f"<a href=\"{register_url}\">לרשום עכשיו →</a>"
+                f"מקומות פנויים: {s['spots']}\n\n"
+                f"<a href=\"{register_url}\">📝 לרשום עכשיו</a>  ·  "
+                f"<a href=\"{waze_url}\">🧭 ניווט בוויז</a>"
             )
             telegram_send(chat_id, msg)
             report_alert_sent(chat_id, f"lead{lead}", s["id"])
