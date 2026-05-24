@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -77,13 +78,24 @@ def http_json(url: str, **kwargs) -> dict:
 
 
 def _fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
-    })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", errors="replace")
+    }
+    # SRF occasionally hiccups (5xx / partial HTML / WAF spikes). One retry
+    # with a short backoff turns most transient failures into successes.
+    last_err = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(3)
+    raise last_err
 
 
 def fetch_html() -> str:
@@ -381,13 +393,14 @@ def main():
         except Exception:
             pass
         return
-    if not sessions:
-        try:
-            telegram_send(ADMIN_CHAT_ID,
-                          "⚠️ <b>סריקת SRF החזירה 0 סשנים</b> — ייתכן שינוי במבנה האתר.")
-        except Exception:
-            pass
     print(f"Parsed {len(sessions)} sessions across windows.")
+    if not sessions:
+        # Transient SRF hiccups (5xx / partial HTML / WAF) are common. Don't
+        # push 0 — that would wipe KV and trigger the worker's stale alert.
+        # The worker's own staleness check will eventually fire (after 60 min)
+        # if this isn't transient, which is the legitimate signal.
+        print("0 sessions parsed — skipping push to preserve previous KV data.", file=sys.stderr)
+        return
 
     push_sessions(sessions)
     users = fetch_users()
