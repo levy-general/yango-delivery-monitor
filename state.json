@@ -1,5 +1,5 @@
 {
-  "deliveryCost": 30,
+  "deliveryCost": 25,
   "minimalCartPrice": 149,
   "below_threshold": false,
   "last_error": null
