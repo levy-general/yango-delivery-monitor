@@ -139,12 +139,19 @@ def parse_sessions(html: str) -> list[dict]:
             continue
         s = SPOTS_RE.search(rest)
         t = TITLE_RE.search(rest)
+        # SRF marks `box_session wrapper disabled` when registration is closed
+        # (either past, full, or registration window already shut). Even if
+        # "X מקומות" still appears in the markup, the user cannot register —
+        # so force spots to 0 to keep the bot from advertising it.
+        spots_val = int(s.group(1)) if s else 0
+        if 'box_session wrapper disabled' in block:
+            spots_val = 0
         out.append({
             "id": m.group("id"),
             "area": m.group("area").strip(),
             "level": int(m.group("level")),
             "start": start,
-            "spots": int(s.group(1)) if s else 0,
+            "spots": spots_val,
             "title": t.group(1).strip() if t else "",
         })
     return out
@@ -206,6 +213,28 @@ def telegram_send(chat_id: int, text: str) -> None:
             r.read()
     except Exception as e:
         print(f"send to {chat_id} failed: {e}", file=sys.stderr)
+
+
+def send_heartbeat(parsed: int = 0) -> None:
+    """Tell the worker that the monitor just ran. Lets the staleness check
+    distinguish 'monitor is down' from 'SRF returned empty'."""
+    if not PUSH_SECRET:
+        return
+    try:
+        req = urllib.request.Request(
+            f"{WORKER_URL}/heartbeat",
+            data=str(parsed).encode(),
+            headers={
+                "Content-Type": "text/plain",
+                "X-Auth": PUSH_SECRET,
+                "User-Agent": "monitor-srf/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+    except Exception as e:
+        print(f"heartbeat failed: {e}", file=sys.stderr)
 
 
 def report_alert_sent(chat_id: int, kind: str, session_id: str | None = None) -> None:
@@ -279,6 +308,15 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
 
     now = datetime.now(TZ)
     window = timedelta(minutes=WINDOW_MIN)
+
+    # Quiet hours: skip alerts for this user when the current IL hour falls
+    # within prefs.quiet_from..quiet_to (window wraps across midnight).
+    qf, qt = prefs.get("quiet_from"), prefs.get("quiet_to")
+    if qf is not None and qt is not None:
+        h = now.hour
+        in_quiet = (qf <= h < qt) if qf < qt else (h >= qf or h < qt)
+        if in_quiet:
+            return
 
     for s in sessions:
         if not matches_prefs(s, prefs):
@@ -383,24 +421,32 @@ def main():
     state = load_state()
 
     ADMIN_CHAT_ID = 328859712
+    parsed_count = 0
     try:
-        sessions = fetch_all_windows(days_ahead=9)
-    except Exception as e:
-        print(f"scrape failed: {e}", file=sys.stderr)
         try:
-            telegram_send(ADMIN_CHAT_ID,
-                          f"⚠️ <b>סריקת SRF נכשלה</b>\n<code>{str(e)[:300]}</code>")
-        except Exception:
-            pass
-        return
-    print(f"Parsed {len(sessions)} sessions across windows.")
-    if not sessions:
-        # Transient SRF hiccups (5xx / partial HTML / WAF) are common. Don't
-        # push 0 — that would wipe KV and trigger the worker's stale alert.
-        # The worker's own staleness check will eventually fire (after 60 min)
-        # if this isn't transient, which is the legitimate signal.
-        print("0 sessions parsed — skipping push to preserve previous KV data.", file=sys.stderr)
-        return
+            sessions = fetch_all_windows(days_ahead=9)
+        except Exception as e:
+            print(f"scrape failed: {e}", file=sys.stderr)
+            try:
+                telegram_send(ADMIN_CHAT_ID,
+                              f"⚠️ <b>סריקת SRF נכשלה</b>\n<code>{str(e)[:300]}</code>")
+            except Exception:
+                pass
+            return
+        parsed_count = len(sessions)
+        print(f"Parsed {parsed_count} sessions across windows.")
+        if not sessions:
+            # Transient SRF hiccups (5xx / partial HTML / WAF) are common. Don't
+            # push 0 — that would wipe KV and trigger the worker's stale alert.
+            # The worker's own staleness check will eventually fire (after 60 min)
+            # if this isn't transient, which is the legitimate signal.
+            print("0 sessions parsed — skipping push to preserve previous KV data.", file=sys.stderr)
+            return
+    finally:
+        # Always heartbeat — even on scrape failures or 0-session skips. Lets
+        # the worker tell apart 'monitor is up but SRF is flaky' (no alert)
+        # from 'monitor itself is down' (real alert).
+        send_heartbeat(parsed_count)
 
     push_sessions(sessions)
     users = fetch_users()
