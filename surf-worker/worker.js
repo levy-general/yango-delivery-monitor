@@ -125,6 +125,47 @@ async function mirrorUserToD1(env, chatId, prefs, status) {
   );
 }
 
+// ---------- Analytics schema (idempotent — runs every cron tick) ----------
+// user_funnel: per-user lifecycle timestamps (first-touch for each stage,
+//   except repeat_reg_ts which is the most-recent repeat registration).
+// sessions_filled: when each SRF session first reached 0 spots — used to
+//   measure how fast sessions sell out.
+// daily_metrics: one row per IL day with aggregated KPIs for fast lookups.
+async function ensureD1Schema(env) {
+  if (!env.DB) return;
+  try {
+    await d1Run(env, `CREATE TABLE IF NOT EXISTS user_funnel (
+      telegram_id INTEGER PRIMARY KEY,
+      start_ts TEXT, onboarded_ts TEXT,
+      first_click_ts TEXT, first_reg_ts TEXT, repeat_reg_ts TEXT
+    )`);
+    await d1Run(env, `CREATE TABLE IF NOT EXISTS sessions_filled (
+      session_id TEXT PRIMARY KEY,
+      level INTEGER, area TEXT, start_ts INTEGER, title TEXT,
+      filled_ts TEXT
+    )`);
+    await d1Run(env, `CREATE TABLE IF NOT EXISTS daily_metrics (
+      day_key TEXT PRIMARY KEY,
+      new_users INTEGER, active_users INTEGER,
+      alerts_sent INTEGER, clicks INTEGER, regs INTEGER,
+      conv_pct INTEGER, top_wave TEXT, peak_hour INTEGER
+    )`);
+  } catch (e) { console.error("ensureD1Schema:", e); }
+}
+
+// First-touch helper for funnel timestamps. Set `alwaysUpdate` to overwrite
+// (used for repeat_reg_ts which tracks the most-recent repeat registration).
+async function recordFunnel(env, chatId, col, opts = {}) {
+  if (!env.DB) return;
+  const setExpr = opts.alwaysUpdate ? `excluded.${col}` : `COALESCE(${col}, excluded.${col})`;
+  try {
+    await d1Run(env,
+      `INSERT INTO user_funnel (telegram_id, ${col}) VALUES (?, datetime('now'))
+       ON CONFLICT(telegram_id) DO UPDATE SET ${col} = ${setExpr}`,
+      [chatId]);
+  } catch (e) {}
+}
+
 async function logSearchD1(env, chatId, cmd, levels, direction, date, matched, available) {
   // matched = sessions matching the user's filter (regardless of spots).
   // available = sessions matching AND with spots > 0 (truly bookable).
@@ -280,18 +321,35 @@ async function markFeedbackAck(env, id) {
 }
 
 // #1 — alert admin if the scraper hasn't pushed fresh data recently.
+// Two signals are considered:
+//   last_scrape  — set when monitor successfully PUSHED sessions (count > 0).
+//   last_attempt — set on every monitor invocation via /heartbeat, regardless
+//                  of result. Decouples "monitor is running" from "scrape
+//                  returned data" (which has been a source of false alerts).
 async function checkScrapeHealth(env) {
-  const raw = await env.KV.get("last_scrape");
+  const rawScrape = await env.KV.get("last_scrape");
+  const rawAttempt = await env.KV.get("last_attempt");
   const now = Date.now();
   let stale = false, info = "";
-  if (!raw) {
+
+  if (!rawScrape) {
     stale = true; info = "אין רישום סריקה כלל";
   } else {
-    const { ts, count } = JSON.parse(raw);
-    const ageMin = Math.round((now - ts) / 60000);
-    if (ageMin > 60) { stale = true; info = `סריקה אחרונה לפני ${ageMin} דק'`; }
-    else if (count === 0) { stale = true; info = "הסריקה האחרונה החזירה 0 סשנים (SRF אולי שינו את האתר)"; }
+    const { ts, count } = JSON.parse(rawScrape);
+    const scrapeAge = Math.round((now - ts) / 60000);
+    const attemptTs = rawAttempt ? JSON.parse(rawAttempt).ts : 0;
+    const attemptAge = attemptTs ? Math.round((now - attemptTs) / 60000) : Infinity;
+
+    if (scrapeAge > 180 && attemptAge > 90) {
+      // Neither real data nor a recent heartbeat — something's genuinely off.
+      stale = true;
+      info = `סריקה אחרונה לפני ${scrapeAge} דק' (heartbeat לפני ${attemptAge} דק')`;
+    } else if (count === 0 && scrapeAge > 180) {
+      stale = true;
+      info = "הסריקה האחרונה החזירה 0 סשנים (SRF אולי שינו את האתר)";
+    }
   }
+
   if (!stale) return;
   if (await env.KV.get("health_alerted")) return;  // already alerted, don't spam
   await env.KV.put("health_alerted", "1", { expirationTtl: 21600 });  // re-arm after 6h
@@ -346,6 +404,186 @@ async function maybeCleanupHistory(env) {
   if ((await env.KV.get("cleanup_day")) === today) return;
   await env.KV.put("cleanup_day", today, { expirationTtl: 172800 });
   await d1Run(env, "DELETE FROM sessions_history WHERE scraped_at < datetime('now','-90 days')");
+}
+
+// Helper: "do this once per day" gate keyed by an IL date string.
+async function _onceADay(env, kvKey) {
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+  if ((await env.KV.get(kvKey)) === today) return false;
+  await env.KV.put(kvKey, today, { expirationTtl: 172800 });
+  return true;
+}
+
+// Diff current vs previous KV-cached sessions; record any session that just
+// reached 0 spots in sessions_filled (one row per session).
+async function trackSessionsFilled(env) {
+  if (!env.DB) return;
+  const current = await getSessions(env);
+  const prevRaw = await env.KV.get("sessions_prev_spots");
+  const prev = prevRaw ? JSON.parse(prevRaw) : {};
+  const next = {};
+  const newlyFilled = [];
+  for (const s of current) {
+    next[s.id] = s.spots;
+    if ((prev[s.id] || 0) > 0 && s.spots === 0) newlyFilled.push(s);
+  }
+  await env.KV.put("sessions_prev_spots", JSON.stringify(next), { expirationTtl: 86400 });
+  for (const s of newlyFilled) {
+    try {
+      await d1Run(env,
+        `INSERT INTO sessions_filled (session_id, level, area, start_ts, title, filled_ts)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(session_id) DO NOTHING`,
+        [s.id, s.level, s.area, s.start, s.title || ""]);
+    } catch (e) {}
+  }
+}
+
+// Once per day after 00:30 IL: aggregate yesterday's KPIs.
+async function maybeRunDailyMetrics(env) {
+  if (!env.DB) return;
+  // Wait until after 00:30 IL so yesterday's data is complete.
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", hour12: false,
+  }).formatToParts(new Date());
+  const hour = parseInt(fmt.find((p) => p.type === "hour").value, 10);
+  if (hour < 0 || hour > 23) return;
+  if (!(await _onceADay(env, "metrics_day"))) return;
+
+  // Compute for yesterday (IL).
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+  const ydate = new Date(today + "T00:00:00+03:00");
+  ydate.setUTCDate(ydate.getUTCDate() - 1);
+  const yKey = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jerusalem", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(ydate);
+  const dayStart = new Date(yKey + "T00:00:00+03:00").getTime();
+  const dayEnd = dayStart + 86400000;
+
+  const known = await getKnownUsers(env);
+  let newUsers = 0, activeUsers = 0, alerts = 0, clicks = 0, regs = 0;
+  const waveCounts = {};
+  const hourCounts = Array(24).fill(0);
+  const fmtH = new Intl.DateTimeFormat("en-GB",
+    { timeZone: "Asia/Jerusalem", hour: "2-digit", hour12: false });
+
+  for (const id of known) {
+    let touchedYesterday = false;
+    for (const e of await getEvents(env, id)) {
+      const ts = new Date(e.ts).getTime();
+      if (ts < dayStart || ts >= dayEnd) continue;
+      touchedYesterday = true;
+      if (e.action === "click") {
+        clicks++;
+        const h = parseInt(fmtH.format(ts), 10);
+        if (!isNaN(h)) hourCounts[h]++;
+        // Wave code via current sessions cache.
+        // (best-effort; falls back to no attribution)
+      }
+      if (e.action === "registration_report" && e.registered) regs++;
+    }
+    if (touchedYesterday) activeUsers++;
+  }
+  // Alerts dispatched yesterday from alerts_sent table.
+  try {
+    const r = await d1First(env,
+      `SELECT COUNT(*) AS c FROM alerts_sent
+        WHERE sent_at >= datetime(?,'unixepoch') AND sent_at < datetime(?,'unixepoch')`,
+      [Math.floor(dayStart / 1000), Math.floor(dayEnd / 1000)]);
+    if (r) alerts = r.c || 0;
+  } catch (e) {}
+  // New users from funnel.
+  try {
+    const r = await d1First(env,
+      `SELECT COUNT(*) AS c FROM user_funnel
+        WHERE start_ts >= datetime(?,'unixepoch') AND start_ts < datetime(?,'unixepoch')`,
+      [Math.floor(dayStart / 1000), Math.floor(dayEnd / 1000)]);
+    if (r) newUsers = r.c || 0;
+  } catch (e) {}
+
+  let peakHour = -1, peakN = 0;
+  hourCounts.forEach((v, i) => { if (v > peakN) { peakN = v; peakHour = i; } });
+
+  const conv = alerts ? Math.round((regs / clicks > 0 ? regs / clicks * 100 : 0)) : 0;
+  const topWave = Object.entries(waveCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+
+  try {
+    await d1Run(env,
+      `INSERT INTO daily_metrics
+         (day_key, new_users, active_users, alerts_sent, clicks, regs, conv_pct, top_wave, peak_hour)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(day_key) DO UPDATE SET
+         new_users = excluded.new_users, active_users = excluded.active_users,
+         alerts_sent = excluded.alerts_sent, clicks = excluded.clicks,
+         regs = excluded.regs, conv_pct = excluded.conv_pct,
+         top_wave = excluded.top_wave, peak_hour = excluded.peak_hour`,
+      [yKey, newUsers, activeUsers, alerts, clicks, regs, conv, topWave, peakN > 0 ? peakHour : null]);
+  } catch (e) {}
+}
+
+// Once a day, trim each user's events array to last 90 days.
+async function maybeRunEventRetention(env) {
+  if (!(await _onceADay(env, "retention_day"))) return;
+  const cutoff = Date.now() - 90 * 86400000;
+  const known = await getKnownUsers(env);
+  for (const id of known) {
+    try {
+      const events = await getEvents(env, id);
+      const trimmed = events.filter((e) => new Date(e.ts).getTime() >= cutoff);
+      if (trimmed.length !== events.length) {
+        await env.KV.put(`events:${id}`, JSON.stringify(trimmed));
+      }
+    } catch (e) {}
+  }
+}
+
+// Once a day, drop personal data of users frozen for 30+ days.
+async function maybeRunPrivacyPurge(env) {
+  if (!(await _onceADay(env, "privacy_day"))) return;
+  const wl = await getWhitelist(env);
+  const known = await getKnownUsers(env);
+  const inWhitelist = new Set(wl);
+  const cutoff = Date.now() - 30 * 86400000;
+  for (const id of known) {
+    if (id === ADMIN_CHAT_ID || inWhitelist.has(id)) continue;
+    try {
+      const prefs = await getUserPrefs(env, id);
+      const lastTouch = prefs && prefs.last_cmd_at ? new Date(prefs.last_cmd_at).getTime() : 0;
+      if (lastTouch && lastTouch > cutoff) continue;
+      await env.KV.delete(userKey(id));
+      await env.KV.delete(`events:${id}`);
+    } catch (e) {}
+  }
+}
+
+// Once a day, alert admin if conversion dropped or clicks crashed.
+async function maybeRunAnomalyCheck(env) {
+  if (!env.DB) return;
+  if (!(await _onceADay(env, "anomaly_day"))) return;
+  try {
+    const r = await d1First(env,
+      `SELECT AVG(conv_pct) AS avg7, AVG(clicks) AS avgClk
+         FROM (SELECT * FROM daily_metrics ORDER BY day_key DESC LIMIT 7)`);
+    const y = await d1First(env,
+      `SELECT * FROM daily_metrics ORDER BY day_key DESC LIMIT 1`);
+    if (!r || !y) return;
+    const issues = [];
+    if (y.conv_pct < (r.avg7 || 0) * 0.6 && y.clicks > 5)
+      issues.push(`המרה צנחה: ${y.conv_pct}% (ממוצע 7d: ${Math.round(r.avg7)}%)`);
+    if (y.clicks < (r.avgClk || 0) * 0.5 && (r.avgClk || 0) > 5)
+      issues.push(`קליקים נפלו: ${y.clicks} (ממוצע 7d: ${Math.round(r.avgClk)})`);
+    if (!issues.length) return;
+    await tg(env, "sendMessage", {
+      chat_id: ADMIN_CHAT_ID,
+      text: `📉 <b>אנומליה זוהתה (${y.day_key})</b>\n` + issues.map((s) => `• ${s}`).join("\n"),
+      parse_mode: "HTML",
+    });
+  } catch (e) {}
 }
 
 async function fireDueHuntAlerts(env) {
@@ -457,6 +695,35 @@ async function getUsers(env) {
 const EVENT_CAP = 500;  // last N events kept per user
 
 async function logEvent(env, chatId, action, params = {}) {
+  // On click: enrich with lead_ms = time from alert dispatch to click.
+  if (action === "click" && env.DB && params.session_id) {
+    try {
+      const row = await d1First(env,
+        `SELECT sent_at FROM alerts_sent
+          WHERE telegram_id = ? AND session_id = ?
+          ORDER BY sent_at DESC LIMIT 1`,
+        [chatId, params.session_id]);
+      if (row && row.sent_at) {
+        params = { ...params, lead_ms: Date.now() - new Date(row.sent_at).getTime() };
+      }
+    } catch (e) {}
+  }
+  // Funnel touchpoints — silent, idempotent.
+  if (action === "click") {
+    recordFunnel(env, chatId, "first_click_ts").catch(() => {});
+  }
+  if (action === "registration_report" && params.registered) {
+    try {
+      const existing = await d1First(env,
+        "SELECT first_reg_ts FROM user_funnel WHERE telegram_id = ?", [chatId]);
+      if (existing && existing.first_reg_ts) {
+        recordFunnel(env, chatId, "repeat_reg_ts", { alwaysUpdate: true }).catch(() => {});
+      } else {
+        recordFunnel(env, chatId, "first_reg_ts").catch(() => {});
+      }
+    } catch (e) {}
+  }
+
   const key = `events:${chatId}`;
   const raw = await env.KV.get(key);
   const events = raw ? JSON.parse(raw) : [];
@@ -472,6 +739,115 @@ async function logEvent(env, chatId, action, params = {}) {
 async function getEvents(env, chatId) {
   const raw = await env.KV.get(`events:${chatId}`);
   return raw ? JSON.parse(raw) : [];
+}
+
+// ---------- Intelligence ----------
+// Composite 0–100 score = 40% recency + 30% frequency + 30% depth.
+// Recency: 0 = inactive 60+ days, 100 = active today.
+// Frequency: alerts last 7d, capped at 14/week → 100.
+// Depth: clicks/alerts ratio across history, capped at 100%.
+function engagementScore(prefs, alertCounts, clickCounts) {
+  const a = alertCounts || {}; const c = clickCounts || {};
+  const daysSince = prefs.last_cmd_at
+    ? Math.min(60, Math.round((Date.now() - new Date(prefs.last_cmd_at).getTime()) / 86400000))
+    : 60;
+  const recency = 100 - (daysSince / 60) * 100;
+  const freq = Math.min(100, ((a.last7 || 0) / 14) * 100);
+  const depth = a.total ? Math.min(100, ((c.total || 0) / a.total) * 100) : 0;
+  return Math.round(recency * 0.4 + freq * 0.3 + depth * 0.3);
+}
+
+// Aggregate clicks across all users by wave code, last `days` days.
+async function topWaveCodesFromEvents(env, days) {
+  const since = Date.now() - days * 86400000;
+  const known = await getKnownUsers(env);
+  const sessions = await getSessions(env);
+  const byId = Object.fromEntries(sessions.map((s) => [s.id, s]));
+  if (env.DB) {
+    try {
+      const r = await d1Run(env, `SELECT session_id, title FROM sessions_history`);
+      for (const row of (r.results || [])) {
+        if (!byId[row.session_id]) byId[row.session_id] = { title: row.title };
+      }
+    } catch (e) {}
+  }
+  const counts = {};
+  for (const id of known) {
+    for (const e of await getEvents(env, id)) {
+      if (e.action !== "click") continue;
+      if (new Date(e.ts).getTime() < since) continue;
+      const s = byId[e.session_id];
+      if (!s) continue;
+      const code = waveCode(s.title || "") || "?";
+      counts[code] = (counts[code] || 0) + 1;
+    }
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([code, count]) => ({ code, count }));
+}
+
+// Peak hour-of-day for clicks (Asia/Jerusalem), last `days` days.
+async function peakClickHour(env, days) {
+  const since = Date.now() - days * 86400000;
+  const known = await getKnownUsers(env);
+  const hours = Array(24).fill(0);
+  const fmt = new Intl.DateTimeFormat("en-GB",
+    { timeZone: "Asia/Jerusalem", hour: "2-digit", hour12: false });
+  for (const id of known) {
+    for (const e of await getEvents(env, id)) {
+      if (e.action !== "click") continue;
+      const t = new Date(e.ts).getTime();
+      if (t < since) continue;
+      const h = parseInt(fmt.format(t), 10);
+      if (!isNaN(h)) hours[h]++;
+    }
+  }
+  let best = -1, n = 0;
+  hours.forEach((v, i) => { if (v > n) { n = v; best = i; } });
+  return n > 0 ? { hour: best, count: n } : null;
+}
+
+// Average click-to-alert reaction time (seconds), last `days` days.
+async function avgClickReaction(env, days) {
+  const since = Date.now() - days * 86400000;
+  const known = await getKnownUsers(env);
+  let sum = 0, n = 0;
+  for (const id of known) {
+    for (const e of await getEvents(env, id)) {
+      if (e.action !== "click" || !e.lead_ms) continue;
+      if (new Date(e.ts).getTime() < since) continue;
+      sum += e.lead_ms; n++;
+    }
+  }
+  return n ? Math.round(sum / n / 1000) : null;
+}
+
+// Funnel snapshot: count of users at each stage.
+async function funnelSnapshot(env) {
+  if (!env.DB) return null;
+  try {
+    const r = await d1First(env,
+      `SELECT
+         SUM(CASE WHEN start_ts IS NOT NULL THEN 1 ELSE 0 END) AS started,
+         SUM(CASE WHEN onboarded_ts IS NOT NULL THEN 1 ELSE 0 END) AS onboarded,
+         SUM(CASE WHEN first_click_ts IS NOT NULL THEN 1 ELSE 0 END) AS clicked,
+         SUM(CASE WHEN first_reg_ts IS NOT NULL THEN 1 ELSE 0 END) AS registered,
+         SUM(CASE WHEN repeat_reg_ts IS NOT NULL THEN 1 ELSE 0 END) AS repeated
+       FROM user_funnel`);
+    return r || null;
+  } catch (e) { return null; }
+}
+
+// Cohort retention: users grouped by signup month → still active (cmd <30d).
+async function cohortMonths(env) {
+  if (!env.DB) return [];
+  try {
+    const r = await d1Run(env,
+      `SELECT substr(start_ts, 1, 7) AS month, COUNT(*) AS n
+         FROM user_funnel WHERE start_ts IS NOT NULL
+         GROUP BY substr(start_ts, 1, 7) ORDER BY month DESC LIMIT 6`);
+    return r.results || [];
+  } catch (e) { return []; }
 }
 
 // ---------- Follow-up queue ----------
@@ -752,7 +1128,7 @@ function renderUserBlock(id, p, status, dot, subscribed, alertCounts, clickCount
   return lines.join("\n");
 }
 
-async function renderUserList(env, chatId) {
+async function renderUserList(env, chatId, filter) {
   const wl = await getWhitelist(env);
   const users = await getUsers(env);
   const known = await getKnownUsers(env);
@@ -763,6 +1139,26 @@ async function renderUserList(env, chatId) {
     if (id === ADMIN_CHAT_ID) { all.push(id); continue; }
     const p = await getUserPrefs(env, id);
     if (p && p.onboarded) all.push(id);
+  }
+  // Filter: active|dormant|paused|frozen|L<n>
+  if (filter) {
+    const kept = [];
+    for (const id of all) {
+      const p = await getUserPrefs(env, id);
+      const inWl = wl.includes(id);
+      const subscribed = users.includes(id);
+      const lvls = (p && getLevels(p)) || [];
+      const lastTouch = p && p.last_cmd_at ? new Date(p.last_cmd_at).getTime() : 0;
+      const days = lastTouch ? (Date.now() - lastTouch) / 86400000 : 999;
+      let match = false;
+      if (filter === "active") match = inWl && subscribed && days <= 14;
+      else if (filter === "dormant") match = inWl && days > 14;
+      else if (filter === "paused") match = inWl && !subscribed;
+      else if (filter === "frozen") match = !inWl;
+      else if (/^l[1-6]$/i.test(filter)) match = lvls.includes(parseInt(filter.slice(1), 10));
+      if (match) kept.push(id);
+    }
+    all.length = 0; all.push(...kept);
   }
 
   let nG = 0, nR = 0, nPaused = 0;
@@ -784,22 +1180,144 @@ async function renderUserList(env, chatId) {
     items.push({ id, p, status, dot, subscribed, alertCounts, clickCounts });
   }
 
+  const header =
+    `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🔴 ${nR}` +
+    (nPaused ? `  ·  🔕 השהה התראות: ${nPaused}` : "") +
+    `\n📨 התראות שנשלחו היום: <b>${totalAlertsToday}</b>` +
+    `\n🔗 קליקים לאתר: היום <b>${totalClicksToday}</b> · סה"כ <b>${totalClicksAll}</b>`;
+  const blocks = items.map(({ id, p, status, dot, subscribed, alertCounts, clickCounts }) =>
+    renderUserBlock(id, p, status, dot, subscribed, alertCounts, clickCounts));
+  const footer =
+    `\n<i>פעולות: <code>/contact &lt;id&gt;</code> · ` +
+    `<code>/revoke &lt;id&gt;</code> · ` +
+    `<code>/approve &lt;id&gt;</code></i>`;
+  // Single consolidated message. Telegram caps at 4096 chars; chunk if needed.
+  const sep = "\n\n———\n\n";
+  const full = header + sep + blocks.join(sep) + footer;
+  if (full.length <= 4090) {
+    await tg(env, "sendMessage", { chat_id: chatId, text: full, parse_mode: "HTML" });
+  } else {
+    // Split into pages of ~3500 chars each, keeping user blocks intact.
+    const pages = [header];
+    for (const b of blocks) {
+      const last = pages[pages.length - 1];
+      if (last.length + sep.length + b.length > 3500) pages.push(b);
+      else pages[pages.length - 1] = last + sep + b;
+    }
+    pages[pages.length - 1] += footer;
+    for (const pg of pages) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: pg, parse_mode: "HTML" });
+    }
+  }
+}
+
+// Single-message admin dashboard: health, funnel, conversion, top patterns.
+async function renderAdminDashboard(env, chatId) {
+  const wl = await getWhitelist(env);
+  const users = await getUsers(env);
+  const known = await getKnownUsers(env);
+  const inWl = new Set(wl);
+  const subscribed = new Set(users);
+
+  let total = 0, active = 0, dormant = 0, paused = 0, frozen = 0, newThisWeek = 0;
+  const weekAgo = Date.now() - 7 * 86400000;
+  for (const id of known) {
+    if (id === ADMIN_CHAT_ID) continue;
+    const p = await getUserPrefs(env, id);
+    if (!p || !p.onboarded) continue;
+    total++;
+    const lastTouch = p.last_cmd_at ? new Date(p.last_cmd_at).getTime() : 0;
+    if (!inWl.has(id)) { frozen++; continue; }
+    if (!subscribed.has(id)) { paused++; continue; }
+    if (lastTouch >= weekAgo - 7 * 86400000) {
+      if ((Date.now() - lastTouch) / 86400000 <= 14) active++;
+      else dormant++;
+    } else dormant++;
+    const f = env.DB
+      ? await d1First(env, "SELECT start_ts FROM user_funnel WHERE telegram_id = ?", [id]).catch(() => null)
+      : null;
+    if (f && f.start_ts && new Date(f.start_ts).getTime() >= weekAgo) newThisWeek++;
+  }
+
+  // Health line
+  const lastScrape = await env.KV.get("last_scrape");
+  let healthLine = "🩺 <b>בריאות:</b> אין רישום סריקה";
+  if (lastScrape) {
+    const { ts, count } = JSON.parse(lastScrape);
+    const ageMin = Math.round((Date.now() - ts) / 60000);
+    const ok = ageMin <= 30 && count > 0;
+    healthLine = `🩺 <b>בריאות:</b> ${ok ? "✅" : "⚠️"} סריקה ${ageMin}d ${count > 0 ? `· ${count} סשנים` : "· 0 סשנים"}`;
+  }
+
+  // Conversion last 7 days from event logs.
+  let alerts7 = 0, clicks7 = 0, regs7 = 0;
+  const since7 = Date.now() - 7 * 86400000;
+  for (const id of known) {
+    for (const e of await getEvents(env, id)) {
+      const t = new Date(e.ts).getTime();
+      if (t < since7) continue;
+      if (e.action === "click") clicks7++;
+      if (e.action === "registration_report" && e.registered) regs7++;
+    }
+  }
+  if (env.DB) {
+    try {
+      const r = await d1First(env,
+        `SELECT COUNT(*) AS c FROM alerts_sent WHERE sent_at >= datetime('now','-7 days')`);
+      if (r) alerts7 = r.c || 0;
+    } catch (e) {}
+  }
+  const conv7 = clicks7 ? Math.round((regs7 / clicks7) * 100) : 0;
+
+  const reactSec = await avgClickReaction(env, 7);
+  const topWaves = await topWaveCodesFromEvents(env, 7);
+  const peak = await peakClickHour(env, 7);
+  const fn = await funnelSnapshot(env);
+  const cohorts = await cohortMonths(env);
+
+  const lines = [
+    `🛠 <b>קאי — דשבורד אדמין</b>`,
+    ``,
+    healthLine,
+    ``,
+    `👥 <b>משתמשים:</b> ${total} (✅ פעיל ${active} · 😴 דורמנט ${dormant} · 🔕 מושהה ${paused} · 🔴 מוקפא ${frozen})`,
+    `   חדשים השבוע: <b>${newThisWeek}</b>`,
+  ];
+  if (fn) {
+    lines.push("");
+    lines.push(`📊 <b>Funnel:</b> התחיל ${fn.started || 0} → השלים ${fn.onboarded || 0} → לחץ ${fn.clicked || 0} → נרשם ${fn.registered || 0} → חוזר ${fn.repeated || 0}`);
+  }
+  lines.push("");
+  lines.push(`📨 <b>7 ימים:</b> אלרטים ${alerts7} · קליקים ${clicks7} · רישומים ${regs7} · המרה <b>${conv7}%</b>`);
+  if (reactSec != null) lines.push(`⏱ זמן תגובה ממוצע לאלרט: <b>${reactSec} שנ׳</b>`);
+  if (peak) lines.push(`⏰ שעת שיא קליקים: <b>${String(peak.hour).padStart(2, "0")}:00</b> (${peak.count})`);
+  if (topWaves.length) {
+    lines.push("");
+    lines.push(`🌊 <b>סוגי גלים שנלחצו השבוע:</b>`);
+    for (const w of topWaves) lines.push(`   • ${w.code} — ${w.count}`);
+  }
+  if (cohorts.length) {
+    lines.push("");
+    lines.push(`📅 <b>Cohorts (שמונה חודשים):</b>`);
+    for (const c of cohorts) lines.push(`   ${c.month}: ${c.n} משתמשים`);
+  }
+  // Yesterday's daily_metrics row, if it ran.
+  if (env.DB) {
+    try {
+      const y = await d1First(env, `SELECT * FROM daily_metrics ORDER BY day_key DESC LIMIT 1`);
+      if (y) {
+        lines.push("");
+        lines.push(`🗓️ <b>אתמול (${y.day_key}):</b> משתמשים פעילים ${y.active_users || 0} · אלרטים ${y.alerts_sent || 0} · קליקים ${y.clicks || 0} · המרה ${y.conv_pct || 0}%`);
+      }
+    } catch (e) {}
+  }
+
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `👥 <b>משתמשים (${all.length})</b> — 🟢 ${nG} · 🔴 ${nR}` +
-      (nPaused ? `  ·  🔕 השהה התראות: ${nPaused}` : "") +
-      `\n📨 התראות שנשלחו היום: <b>${totalAlertsToday}</b>` +
-      `\n🔗 קליקים לאתר: היום <b>${totalClicksToday}</b> · סה"כ <b>${totalClicksAll}</b>`,
+    text: lines.join("\n"),
     parse_mode: "HTML",
+    disable_web_page_preview: true,
   });
-  for (const { id, p, status, dot, subscribed, alertCounts, clickCounts } of items) {
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: renderUserBlock(id, p, status, dot, subscribed, alertCounts, clickCounts),
-      parse_mode: "HTML",
-      reply_markup: userActionKeyboard(id, status, p),
-    });
-  }
 }
 
 async function notifyAdminNewUser(env, msg) {
@@ -1129,6 +1647,7 @@ async function cmdStart(env, chatId, from) {
     prefs.username = from.username || prefs.username;
     await setUserPrefs(env, chatId, prefs);
   }
+  recordFunnel(env, chatId, "start_ts").catch(() => {});
 
   // If everything's already set, skip onboarding and just say hi.
   const lvls = getLevels(prefs);
@@ -1232,6 +1751,63 @@ async function cmdShare(env, chatId) {
     reply_markup: { inline_keyboard: [[
       { text: "👥 שתף את הבוט", url: shareUrl },
     ]] },
+  });
+}
+
+async function cmdHelp(env, chatId) {
+  const txt =
+    `👋 <b>אני קאי</b> — מודיע על סשנים פנויים בסרף פארק ת"א לפי ההעדפות שלך.\n\n` +
+    `<b>פקודות עיקריות:</b>\n` +
+    `/today — סטטוס הסשנים שלך להיום\n` +
+    `/date — בחירת תאריך ספציפי\n` +
+    `/quiet — שעות שקטות (לדוגמה: <code>/quiet 22 06</code>)\n` +
+    `/reset — שינוי רמת גל וכיוון\n` +
+    `/stop — השהיית התראות · /resume — חידוש\n` +
+    `/feedback — שליחת באג / רעיון\n` +
+    `/share — שיתוף הבוט עם חבר\n\n` +
+    `<i>מקבל התראה? לחיצה על הסשן פותחת אותו ישר באתר. הקישור 🧭 פותח ניווט בוויז.</i>`;
+  await tg(env, "sendMessage", { chat_id: chatId, text: txt, parse_mode: "HTML" });
+}
+
+async function cmdQuiet(env, chatId, text) {
+  const args = (text || "").split(/\s+/).slice(1);
+  const prefs = (await getUserPrefs(env, chatId)) || {};
+  if (!args.length) {
+    const qf = prefs.quiet_from, qt = prefs.quiet_to;
+    const active = (qf != null && qt != null);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text:
+        (active
+          ? `🔕 <b>שעות שקטות פעילות:</b> ${String(qf).padStart(2, "0")}:00 — ${String(qt).padStart(2, "0")}:00 (אסיה/ירושלים)`
+          : `🔔 <b>אין שעות שקטות מוגדרות.</b>`) +
+        `\n\nשימוש:\n` +
+        `<code>/quiet 22 06</code> — לא להתריע בין 22:00 ל-06:00\n` +
+        `<code>/quiet off</code> — לבטל שעות שקטות`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  if (args[0] === "off" || args[0] === "ביטול") {
+    delete prefs.quiet_from; delete prefs.quiet_to;
+    await setUserPrefs(env, chatId, prefs);
+    await tg(env, "sendMessage", { chat_id: chatId, text: "🔔 שעות שקטות בוטלו." });
+    return;
+  }
+  const from = parseInt(args[0], 10), to = parseInt(args[1], 10);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || from > 23 || to < 0 || to > 23) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "❌ פורמט לא תקין. דוגמה: <code>/quiet 22 06</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  prefs.quiet_from = from; prefs.quiet_to = to;
+  await setUserPrefs(env, chatId, prefs);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `🔕 שעות שקטות נשמרו: ${String(from).padStart(2, "0")}:00 — ${String(to).padStart(2, "0")}:00 (אסיה/ירושלים). לא ישלחו התראות בחלון הזה.`,
   });
 }
 
@@ -1363,8 +1939,19 @@ async function cmdStop(env, chatId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
-      "⏸ ההתראות הושהו.\n" +
-      "ההגדרות שלך נשמרו — שלח /resume לחדש.",
+      "⏸ ההתראות הושהו.\nההגדרות שלך נשמרו — שלח /resume לחדש.\n\n" +
+      "<i>מה הסיבה? (עוזר לי להשתפר)</i>",
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [
+      [
+        { text: "לא רלוונטי כרגע", callback_data: "stopreason:not_relevant" },
+        { text: "יותר מדי התראות", callback_data: "stopreason:too_many" },
+      ],
+      [
+        { text: "לא נרשמתי בכלל", callback_data: "stopreason:never_registered" },
+        { text: "אחר / לדלג", callback_data: "stopreason:other" },
+      ],
+    ] },
   });
 }
 
@@ -1666,6 +2253,19 @@ async function handleUpdate(env, update) {
       return;
     }
 
+    // Churn reason after /stop — silent feedback, single click then thanks.
+    if (data.startsWith("stopreason:")) {
+      const reason = data.split(":")[1];
+      await logEvent(env, chatId, "stop_reason", { reason });
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: msgId,
+        text: "🙏 תודה — ההגדרות נשמרו. /resume לחדש בכל רגע.",
+      });
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
+      return;
+    }
+
     // Admin → official outreach to a user, sent AS the bot (Kai).
     if (data.startsWith("contactuser:")) {
       if (chatId !== ADMIN_CHAT_ID) {
@@ -1853,21 +2453,33 @@ async function handleUpdate(env, update) {
         ));
         // 🗓️ is a generic calendar glyph (no baked-in date number, unlike 📅).
         const dateLine = `🗓️ <b>${wd}, ${wantedDay}</b>`;
-        if (result.sessions && result.sessions.length) {
-          await tg(env, "sendMessage", {
-            chat_id: chatId,
-            text: `${dateLine}\n🤙 איזה גל בא לך לתפוס?`,
-            parse_mode: "HTML",
-            reply_markup: await sessionsKeyboard(env, chatId, result.sessions, origin, prefs),
-          });
-        } else {
-          await tg(env, "sendMessage", {
-            chat_id: chatId,
-            text: `${dateLine}\n🌊 הים לא מחכה — תתן לי לנפנף לך כשיתפנה מקום?`,
-            parse_mode: "HTML",
-            reply_markup: huntKeyboardForPrefs(prefs, dayKey),
-          });
+        const payload =
+          result.sessions && result.sessions.length
+            ? {
+                text: `${dateLine}\n🤙 איזה גל בא לך לתפוס?`,
+                reply_markup: await sessionsKeyboard(env, chatId, result.sessions, origin, prefs),
+              }
+            : {
+                text: `${dateLine}\n🌊 הים לא מחכה — תתן לי לנפנף לך כשיתפנה מקום?`,
+                reply_markup: huntKeyboardForPrefs(prefs, dayKey),
+              };
+        // Replace the previous /date sessions message instead of stacking
+        // duplicates when the user picks several dates in a row.
+        if (prefs.date_msg_id) {
+          try {
+            await tg(env, "deleteMessage", { chat_id: chatId, message_id: prefs.date_msg_id });
+          } catch (e) {}
         }
+        const sent = await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: payload.text,
+          parse_mode: "HTML",
+          reply_markup: payload.reply_markup,
+        });
+        const mid = sent && sent.result && sent.result.message_id;
+        const fresh = (await getUserPrefs(env, chatId)) || {};
+        fresh.date_msg_id = mid || null;
+        await setUserPrefs(env, chatId, fresh);
       }
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
       return;
@@ -1927,6 +2539,7 @@ async function handleUpdate(env, update) {
       prefs.pending = null;
       const firstCompletion = !prefs.onboarded;
       prefs.onboarded = true;
+      if (firstCompletion) recordFunnel(env, chatId, "onboarded_ts").catch(() => {});
       await setUserPrefs(env, chatId, prefs);
       await addUser(env, chatId);
       await setUserMenu(env, chatId, false);
@@ -2002,7 +2615,11 @@ async function handleUpdate(env, update) {
   if (chatId === ADMIN_CHAT_ID && text.startsWith("/")) {
     const parts = text.split(/\s+/);
     if (parts[0] === "/list") {
-      await renderUserList(env, chatId);
+      await renderUserList(env, chatId, parts[1] ? String(parts[1]).toLowerCase() : null);
+      return;
+    }
+    if (parts[0] === "/admin") {
+      await renderAdminDashboard(env, chatId);
       return;
     }
     if (parts[0] === "/report") {
@@ -2156,6 +2773,35 @@ async function handleUpdate(env, update) {
       });
       return;
     }
+    if (parts[0] === "/contact") {
+      const target = parts[1] ? parseInt(parts[1], 10) : NaN;
+      if (!Number.isFinite(target)) {
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text:
+            "שימוש: <code>/contact &lt;chat_id&gt; [הודעה]</code>\n" +
+            "אם תכלול טקסט — נשלח מיד; בלי טקסט — נשאל אותך מה לכתוב.",
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      const body = text.split(/\s+/).slice(2).join(" ").trim();
+      if (body) {
+        await sendAsKai(env, target, body);
+      } else {
+        const ap = (await getUserPrefs(env, ADMIN_CHAT_ID)) || {};
+        ap.pending = `contact:${target}`;
+        await setUserPrefs(env, ADMIN_CHAT_ID, ap);
+        await tg(env, "sendMessage", {
+          chat_id: ADMIN_CHAT_ID,
+          text:
+            `✍️ כתוב את ההודעה שתישלח למשתמש <code>${target}</code> בשם <b>קאי</b>.\n` +
+            `(לביטול: /start)`,
+          parse_mode: "HTML",
+        });
+      }
+      return;
+    }
   }
 
   // Auto-approve every new chat so they can run /start. Admin notification
@@ -2240,7 +2886,7 @@ async function handleUpdate(env, update) {
   }
 
   const cmd = text.split(/\s+/)[0].split("@")[0];
-  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/feedback", "/share"]);
+  const KNOWN_CMDS = new Set(["/start", "/reset", "/today", "/date", "/stop", "/resume", "/feedback", "/share", "/help", "/quiet"]);
   if (KNOWN_CMDS.has(cmd)) {
     const fresh = (await getUserPrefs(env, chatId)) || {};
     fresh.cmd_count = (fresh.cmd_count || 0) + 1;
@@ -2266,6 +2912,8 @@ async function handleUpdate(env, update) {
   else if (cmd === "/resume") await cmdResume(env, chatId);
   else if (cmd === "/feedback") await cmdFeedback(env, chatId);
   else if (cmd === "/share") await cmdShare(env, chatId);
+  else if (cmd === "/help") await cmdHelp(env, chatId);
+  else if (cmd === "/quiet") await cmdQuiet(env, chatId, text);
 }
 
 // ---------- Worker entry ----------
@@ -2273,11 +2921,17 @@ export default {
   async scheduled(event, env, ctx) {
     // Cron trigger every 5 min.
     ctx.waitUntil(Promise.all([
+      ensureD1Schema(env),
       processDueFollowups(env),
       fireDueHuntAlerts(env),
       checkScrapeHealth(env),
       maybeNudgeRestrictiveUsers(env),
       maybeCleanupHistory(env),
+      trackSessionsFilled(env),
+      maybeRunDailyMetrics(env),
+      maybeRunEventRetention(env),
+      maybeRunPrivacyPurge(env),
+      maybeRunAnomalyCheck(env),
     ]));
   },
 
@@ -2425,6 +3079,19 @@ export default {
       return new Response("ok");
     }
 
+    // Lightweight liveness signal from the monitor — bumps `last_attempt` so
+    // the health check tolerates an SRF blip that prevented a real push.
+    if (url.pathname === "/heartbeat" && request.method === "POST") {
+      const auth = request.headers.get("X-Auth") || "";
+      if (!env.PUSH_SECRET || auth !== env.PUSH_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      let parsed = 0;
+      try { parsed = parseInt((await request.text() || "0"), 10) || 0; } catch (e) {}
+      await env.KV.put("last_attempt", JSON.stringify({ ts: Date.now(), parsed }));
+      return new Response("ok");
+    }
+
     if (url.pathname === "/sessions" && request.method === "POST") {
       const auth = request.headers.get("X-Auth") || "";
       if (!env.PUSH_SECRET || auth !== env.PUSH_SECRET) {
@@ -2442,8 +3109,9 @@ export default {
       }
       // Health heartbeat: record last successful scrape + session count.
       await env.KV.put("last_scrape", JSON.stringify({ ts: Date.now(), count }));
-      // Clear any prior staleness-alert flag so a fresh outage re-alerts.
-      await env.KV.delete("health_alerted");
+      // (Intentionally NOT clearing `health_alerted` here — its 6h TTL
+      // controls re-alert cadence and was being reset on every push, causing
+      // staleness alerts to fire far more often than once per outage.)
       return new Response("ok");
     }
 
