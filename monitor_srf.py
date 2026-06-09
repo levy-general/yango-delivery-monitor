@@ -139,19 +139,18 @@ def parse_sessions(html: str) -> list[dict]:
             continue
         s = SPOTS_RE.search(rest)
         t = TITLE_RE.search(rest)
-        # SRF marks `box_session wrapper disabled` when registration is closed
-        # (either past, full, or registration window already shut). Even if
-        # "X מקומות" still appears in the markup, the user cannot register —
-        # so force spots to 0 to keep the bot from advertising it.
-        spots_val = int(s.group(1)) if s else 0
-        if 'box_session wrapper disabled' in block:
-            spots_val = 0
+        # Don't gate on the `disabled` class — SRF applies it to BOTH "past /
+        # registration shut" AND "registration window not opened yet", and a
+        # future bookable session like 07:00 tomorrow with 6 spots is also
+        # marked disabled. SPOTS_RE returning None ("לא נותרו מקומות") is the
+        # reliable sold-out signal; the bot's `s.start > now` filter handles
+        # past sessions.
         out.append({
             "id": m.group("id"),
             "area": m.group("area").strip(),
             "level": int(m.group("level")),
             "start": start,
-            "spots": spots_val,
+            "spots": int(s.group(1)) if s else 0,
             "title": t.group(1).strip() if t else "",
         })
     return out
