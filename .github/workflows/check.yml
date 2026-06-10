@@ -1,12 +1,12 @@
 name: Check prices and surf sessions
 
 on:
-  # GH schedule cron at every 5 minutes — public repo has unlimited Actions
+  # GH schedule cron at every 10 minutes — public repo has unlimited Actions
   # minutes, and the concurrency group below queues overlapping runs so we
   # never run two at once. cron-job.org's workflow_dispatch ping every 15 min
   # stays as a reliability belt-and-suspenders (GH schedule can be delayed).
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
