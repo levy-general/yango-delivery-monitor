@@ -1,11 +1,12 @@
 name: Check prices and surf sessions
 
 on:
-  # External trigger via cron-job.org calls the workflow_dispatch API every 15
-  # minutes; that's reliable. GH's own schedule cron is unreliable, so we keep
-  # it as a once-per-hour backup only.
+  # GH schedule cron at every 5 minutes — public repo has unlimited Actions
+  # minutes, and the concurrency group below queues overlapping runs so we
+  # never run two at once. cron-job.org's workflow_dispatch ping every 15 min
+  # stays as a reliability belt-and-suspenders (GH schedule can be delayed).
   schedule:
-    - cron: "5 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
