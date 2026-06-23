@@ -330,9 +330,21 @@ def process_user_alerts(user: dict, sessions: list[dict], state: dict) -> None:
 
             mins_to = int(time_until.total_seconds() / 60)
             register_url = f"{WORKER_URL}/r/{chat_id}/{s['id']}?lead={lead}"
-            # Waze deep-link → opens the app (or web) with live-traffic navigation
-            # to Surf Park. Far more accurate than any server-side ETA estimate.
-            waze_url = f"https://waze.com/ul?ll={SURF_PARK_COORDS[0]},{SURF_PARK_COORDS[1]}&navigate=yes"
+            # Waze deep-link: livemap from→to when the user has a saved
+            # address so navigation starts from home, not the device's
+            # current GPS location. Falls back to destination-only link
+            # otherwise.
+            dest_ll = f"{SURF_PARK_COORDS[0]},{SURF_PARK_COORDS[1]}"
+            lat, lon = prefs.get("lat"), prefs.get("lon")
+            if lat is not None and lon is not None:
+                waze_url = (
+                    "https://www.waze.com/live-map/directions"
+                    f"?to=ll.{urllib.parse.quote(dest_ll)}"
+                    f"&from=ll.{urllib.parse.quote(f'{lat},{lon}')}"
+                    "&utm_source=waze_website"
+                )
+            else:
+                waze_url = f"https://waze.com/ul?ll={dest_ll}&navigate=yes"
             msg = (
                 f"🏄 <b>Surf Park</b>\n"
                 f"שם הסשן: {s['title']}\n"
